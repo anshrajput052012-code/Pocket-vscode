@@ -1,0 +1,448 @@
+name: Build Standalone VS Code APK
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# One build at a time: run_number (versionCode), the keystore commit and the release tag must not race.
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # versionCode = run number + this offset. A NEW repository restarts the run number at 1, and Android refuses to
+  # install a lower versionCode over a higher one ("App not installed"). 1000 keeps every build of a new repo above
+  # all builds made in the old one (highest there: 29). Use 0 only in a repository whose run numbers already are
+  # above anything installed. Never lower this once builds with it were installed.
+  VERSION_CODE_OFFSET: "1000"
+
+jobs:
+  build-arm64-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout Project Source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Restore Folder Structure and Root Configs
+        run: |
+          for f in app__*; do
+            if [ -f "$f" ]; then
+              target=$(echo "$f" | sed 's/__/\//g')
+              mkdir -p "$(dirname "$target")"
+              mv "$f" "$target"
+            fi
+          done
+
+          cat > settings.gradle.kts << 'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "PocketVSCode"
+          include(":app")
+          EOF
+
+          cat > build.gradle.kts << 'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+
+          cat > gradle.properties << 'EOF'
+          org.gradle.jvmargs=-Xmx4096m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          android.nonTransitiveRClass=true
+          EOF
+
+          for need in app/build.gradle.kts app/src/main/AndroidManifest.xml \
+                      app/src/main/java/com/vscode/desktop/standalone/MainActivity.kt \
+                      app/src/main/java/com/vscode/desktop/standalone/WorkbenchActivity.kt \
+                      app/src/main/java/com/vscode/desktop/standalone/StandaloneProvisioner.kt \
+                      app/src/main/java/com/vscode/desktop/standalone/ProotProcessManager.kt \
+                      app/src/main/java/com/vscode/desktop/standalone/LinuxRuntimeService.kt \
+                      app/src/main/assets/start-vscode-session.sh \
+                      app/src/main/assets/init-rootfs.sh \
+                      app/src/main/res/values/strings.xml \
+                      app/src/main/res/values/colors.xml \
+                      app/src/main/res/drawable/ic_stat_vscode.xml; do
+            if [ ! -f "$need" ]; then
+              echo "::error::Missing project file after restore: $need (upload every app__* file from the repo)"
+              exit 1
+            fi
+          done
+
+      - name: Lock Package ID (com.pocket.vscode) and Auto-Increment Version
+        run: |
+          VERSION_CODE=$(( ${{ github.run_number }} + ${VERSION_CODE_OFFSET:-0} ))
+          echo "VERSION_CODE=$VERSION_CODE" >> "$GITHUB_ENV"
+
+          # applicationId is also hard-coded in app/build.gradle.kts; this keeps it locked even if that file is replaced.
+          find app -name "build.gradle.kts" -exec sed -i 's/applicationId = "[^"]*"/applicationId = "com.pocket.vscode"/g' {} +
+          # versionCode always increases -> every new APK installs as an UPDATE, no uninstall needed.
+          find app -name "build.gradle.kts" -exec sed -i "s/versionCode = [0-9]*/versionCode = $VERSION_CODE/g" {} +
+          find app -name "build.gradle.kts" -exec sed -i 's/versionName = "[^"]*"/versionName = "1.0.${{ github.run_number }}"/g' {} +
+
+          grep -q 'applicationId = "com.pocket.vscode"' app/build.gradle.kts || { echo "::error::applicationId is not locked to com.pocket.vscode"; exit 1; }
+          grep -q "versionCode = $VERSION_CODE\$" app/build.gradle.kts || { echo "::error::versionCode was not set to $VERSION_CODE"; exit 1; }
+          grep -n 'applicationId\|versionCode\|versionName' app/build.gradle.kts
+
+      - name: Restore or Generate Permanent Signing Keystore
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p ~/.android app /tmp/keystore_dl
+          RESTORED=false
+
+          # 1) keystore committed in the repo (app/keystore.jks)
+          if [ -f "app/keystore.jks" ]; then
+            echo "Using permanent keystore from the repository (app/keystore.jks)."
+            RESTORED=true
+          fi
+
+          # 2) keystore saved with an earlier GitHub Release
+          if [ "$RESTORED" = "false" ]; then
+            if gh release download --pattern "pocket-vscode-permanent.keystore" --dir /tmp/keystore_dl --clobber 2>/dev/null; then
+              if [ -s "/tmp/keystore_dl/pocket-vscode-permanent.keystore" ]; then
+                echo "Restored permanent keystore from the latest GitHub Release."
+                cp /tmp/keystore_dl/pocket-vscode-permanent.keystore app/keystore.jks
+                RESTORED=true
+              fi
+            fi
+          fi
+
+          # 3) first ever build: generate it once; it is saved below and reused forever
+          if [ "$RESTORED" = "false" ]; then
+            echo "No keystore found anywhere - generating the permanent keystore (first build only)."
+            keytool -genkeypair -v \
+              -keystore app/keystore.jks \
+              -alias androiddebugkey \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -storepass android \
+              -keypass android \
+              -dname "CN=PocketVSCode, OU=Dev, O=Standalone, L=Bijnor, ST=UP, C=IN"
+          fi
+
+          # A keystore that cannot be opened must STOP the build: silently signing with another key would break updates.
+          if ! keytool -list -keystore app/keystore.jks -storepass android -alias androiddebugkey >/dev/null 2>&1; then
+            echo "::error::app/keystore.jks cannot be opened with alias 'androiddebugkey' / password 'android'."
+            exit 1
+          fi
+
+          cp app/keystore.jks ~/.android/debug.keystore
+          cp app/keystore.jks pocket-vscode-permanent.keystore
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f app/keystore.jks || true
+          git commit -m "chore: save permanent keystore" || true
+          git push origin HEAD:${{ github.ref_name }} || true
+
+      - name: Generate VS Code Icons (adaptive + legacy, all densities)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y python3-pil curl
+
+          # Remove any default Android robot launcher resources
+          rm -rf app/src/main/res/mipmap-anydpi*
+          rm -rf app/src/main/res/mipmap-*/ic_launcher*
+          rm -rf app/src/main/res/drawable*/ic_launcher*
+
+          # Icon source priority: 1) icon.png in the repo root (your own image)  2) official VS Code icon
+          rm -f vscode_icon.png
+          if [ -f icon.png ]; then
+            echo "Using icon.png from the repository root."
+            cp icon.png vscode_icon.png
+          else
+            curl -fsSL --retry 3 "https://cdn.jsdelivr.net/gh/microsoft/vscode/resources/linux/code.png" -o vscode_icon.png \
+              || curl -fsSL --retry 3 "https://raw.githubusercontent.com/microsoft/vscode/main/resources/linux/code.png" -o vscode_icon.png \
+              || echo "Icon download failed - a generated fallback icon will be used."
+          fi
+
+          python3 - << 'EOF'
+          import os
+          from PIL import Image, ImageDraw
+
+          RES = "app/src/main/res"
+          BG = (30, 30, 30, 255)  # #1E1E1E
+
+          def load_source():
+              path = "vscode_icon.png"
+              if os.path.isfile(path) and os.path.getsize(path) > 1024:
+                  try:
+                      Image.open(path).verify()
+                      return Image.open(path).convert("RGBA")
+                  except Exception as e:
+                      print("Icon file unusable:", e)
+              # Fallback so the build never fails because of the icon: simple blue "</>" mark (original artwork)
+              img = Image.new("RGBA", (512, 512), (0, 0, 0, 0))
+              d = ImageDraw.Draw(img)
+              d.rounded_rectangle((32, 32, 480, 480), radius=96, fill=(0, 122, 204, 255))
+              w = 36
+              d.line([(212, 160), (116, 256), (212, 352)], fill="white", width=w, joint="curve")
+              d.line([(300, 160), (396, 256), (300, 352)], fill="white", width=w, joint="curve")
+              d.line([(276, 150), (236, 362)], fill="white", width=26)
+              return img
+
+          def tight_square(img):
+              box = img.getbbox()
+              if box:
+                  img = img.crop(box)
+              side = max(img.size)
+              sq = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+              sq.paste(img, ((side - img.width) // 2, (side - img.height) // 2), img)
+              return sq
+
+          src = tight_square(load_source())
+
+          # ---- adaptive icon definition (API 26+): #1E1E1E background + centred foreground ----
+          v26 = os.path.join(RES, "mipmap-anydpi-v26")
+          os.makedirs(v26, exist_ok=True)
+          adaptive_xml = """<?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_launcher_background" />
+              <foreground android:drawable="@mipmap/ic_launcher_foreground" />
+          </adaptive-icon>
+          """
+          for name in ("ic_launcher.xml", "ic_launcher_round.xml"):
+              with open(os.path.join(v26, name), "w") as f:
+                  f.write(adaptive_xml)
+
+          # (legacy launcher size, adaptive 108dp canvas size) per density
+          densities = {
+              "mipmap-mdpi": (48, 108),
+              "mipmap-hdpi": (72, 162),
+              "mipmap-xhdpi": (96, 216),
+              "mipmap-xxhdpi": (144, 324),
+              "mipmap-xxxhdpi": (192, 432),
+          }
+
+          for folder, (legacy, adaptive) in densities.items():
+              out = os.path.join(RES, folder)
+              os.makedirs(out, exist_ok=True)
+
+              # adaptive foreground: logo inside the 66dp safe zone of the 108dp canvas
+              fg = Image.new("RGBA", (adaptive, adaptive), (0, 0, 0, 0))
+              inner = int(adaptive * 0.58)
+              logo = src.resize((inner, inner), Image.Resampling.LANCZOS)
+              fg.paste(logo, ((adaptive - inner) // 2, (adaptive - inner) // 2), logo)
+              fg.save(os.path.join(out, "ic_launcher_foreground.png"))
+
+              # legacy square + round icons (used only by launchers that ignore adaptive icons)
+              big = legacy * 4
+              plate = Image.new("RGBA", (big, big), (0, 0, 0, 0))
+              ImageDraw.Draw(plate).rounded_rectangle((0, 0, big - 1, big - 1), radius=int(big * 0.22), fill=BG)
+              inner_l = int(big * 0.68)
+              logo_l = src.resize((inner_l, inner_l), Image.Resampling.LANCZOS)
+              plate.paste(logo_l, ((big - inner_l) // 2, (big - inner_l) // 2), logo_l)
+              plate.resize((legacy, legacy), Image.Resampling.LANCZOS).save(os.path.join(out, "ic_launcher.png"))
+
+              disc = Image.new("RGBA", (big, big), (0, 0, 0, 0))
+              ImageDraw.Draw(disc).ellipse((0, 0, big - 1, big - 1), fill=BG)
+              inner_r = int(big * 0.60)
+              logo_r = src.resize((inner_r, inner_r), Image.Resampling.LANCZOS)
+              disc.paste(logo_r, ((big - inner_r) // 2, (big - inner_r) // 2), logo_r)
+              disc.resize((legacy, legacy), Image.Resampling.LANCZOS).save(os.path.join(out, "ic_launcher_round.png"))
+
+          print("Icons generated for", ", ".join(densities))
+          EOF
+
+          grep -q '@mipmap/ic_launcher"' app/src/main/AndroidManifest.xml || { echo "::error::Manifest does not reference @mipmap/ic_launcher"; exit 1; }
+          ls app/src/main/res/mipmap-xxxhdpi app/src/main/res/mipmap-anydpi-v26
+
+      - name: Pre-Bundle Debian Rootfs and Official VS Code
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p app/src/main/assets
+          rm -f app/src/main/assets/debian-rootfs.tar.* app/src/main/assets/vscode-linux-arm64.tar.*
+
+          # Candidate rootfs URLs, best first. Pinned to Debian bookworm: init-rootfs.sh package names match it.
+          python3 - << 'EOF' > /tmp/rootfs_urls.txt
+          import json, subprocess, sys
+          urls = []
+          try:
+              res = subprocess.run(
+                  ["gh", "api", "repos/termux/proot-distro/releases?per_page=100"],
+                  capture_output=True, text=True, timeout=120)
+              for rel in json.loads(res.stdout):
+                  for asset in rel.get("assets", []):
+                      n = asset.get("name", "")
+                      if n.startswith("debian-bookworm") and "aarch64" in n and (n.endswith(".tar.xz") or n.endswith(".tar.gz")):
+                          urls.append(asset["browser_download_url"])
+          except Exception as e:
+              print("proot-distro release lookup failed:", e, file=sys.stderr)
+          urls.append("https://raw.githubusercontent.com/debuerreotype/docker-debian-artifacts/dist-arm64v8/bookworm/rootfs.tar.xz")
+          urls.append("http://cdimage.ubuntu.com/ubuntu-base/releases/22.04/release/ubuntu-base-22.04-base-arm64.tar.gz")
+          print("\n".join(urls))
+          EOF
+
+          OK=false
+          while read -r URL; do
+            [ -z "$URL" ] && continue
+            case "$URL" in
+              *.xz) EXT=xz ;;
+              *)    EXT=gz ;;
+            esac
+            DEST="app/src/main/assets/debian-rootfs.tar.$EXT"
+            rm -f app/src/main/assets/debian-rootfs.tar.*
+            echo "Trying rootfs: $URL"
+            if curl -fL --retry 4 --retry-delay 5 --connect-timeout 30 -A "Mozilla/5.0" -o "$DEST" "$URL"; then
+              SIZE=$(stat -c %s "$DEST")
+              if [ "$SIZE" -gt 10485760 ]; then
+                if { [ "$EXT" = "xz" ] && xz -t "$DEST"; } || { [ "$EXT" = "gz" ] && gzip -t "$DEST"; }; then
+                  OK=true
+                  break
+                fi
+              fi
+            fi
+          done < /tmp/rootfs_urls.txt
+
+          if [ "$OK" != "true" ]; then
+            echo "::error::Could not download a valid Debian ARM64 rootfs from any source."
+            exit 1
+          fi
+          ls -lh app/src/main/assets/
+
+          curl -fSL --retry 4 --retry-delay 5 --connect-timeout 30 -H "User-Agent: Mozilla/5.0" \
+            "https://update.code.visualstudio.com/latest/linux-arm64/stable" \
+            -o app/src/main/assets/vscode-linux-arm64.tar.gz
+          gzip -t app/src/main/assets/vscode-linux-arm64.tar.gz
+          if [ "$(stat -c %s app/src/main/assets/vscode-linux-arm64.tar.gz)" -lt 52428800 ]; then
+            echo "::error::VS Code archive is suspiciously small."
+            exit 1
+          fi
+          ls -lh app/src/main/assets/
+
+      - name: Fetch and Patch ARM64 Binaries
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y patchelf
+          mkdir -p /tmp/debs
+          cd /tmp/debs
+          PACKAGES_URL="https://packages.termux.dev/apt/termux-main/dists/stable/main/binary-aarch64/Packages"
+          curl -fsSL --retry 3 "$PACKAGES_URL" -o Packages
+          PROOT_DEB_PATH=$(awk '/^Package: proot$/,/^$/' Packages | grep '^Filename:' | head -n 1 | awk '{print $2}')
+          TALLOC_DEB_PATH=$(awk '/^Package: libtalloc$/,/^$/' Packages | grep '^Filename:' | head -n 1 | awk '{print $2}')
+          SHMEM_DEB_PATH=$(awk '/^Package: libandroid-shmem$/,/^$/' Packages | grep '^Filename:' | head -n 1 | awk '{print $2}')
+          if [ -z "$SHMEM_DEB_PATH" ]; then
+            SHMEM_DEB_PATH=$(grep -E 'libandroid-shmem.*_aarch64\.deb' Packages | head -n 1 | awk '{print $2}')
+          fi
+          for v in PROOT_DEB_PATH TALLOC_DEB_PATH SHMEM_DEB_PATH; do
+            if [ -z "${!v}" ]; then echo "::error::$v not found in the Termux package index"; exit 1; fi
+          done
+          curl -fsSL --retry 3 "https://packages.termux.dev/apt/termux-main/$PROOT_DEB_PATH" -o proot.deb
+          curl -fsSL --retry 3 "https://packages.termux.dev/apt/termux-main/$TALLOC_DEB_PATH" -o talloc.deb
+          curl -fsSL --retry 3 "https://packages.termux.dev/apt/termux-main/$SHMEM_DEB_PATH" -o shmem.deb
+          mkdir -p extract
+          for f in proot.deb talloc.deb shmem.deb; do
+            mkdir -p "extract/$f"
+            cd "extract/$f"
+            ar x "/tmp/debs/$f"
+            tar -xf data.tar.*
+            cd /tmp/debs
+          done
+          DEST="$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a"
+          mkdir -p "$DEST"
+          TALLOC_SRC=$(find extract -name "libtalloc.so*" | head -n 1)
+          cp "$TALLOC_SRC" "$DEST/libtalloc.so"
+          patchelf --set-soname libtalloc.so "$DEST/libtalloc.so"
+          patchelf --set-rpath '$ORIGIN' "$DEST/libtalloc.so" || true
+          SHMEM_SRC=$(find extract -name "libandroid-shmem.so*" | head -n 1)
+          cp "$SHMEM_SRC" "$DEST/libandroid-shmem.so"
+          patchelf --set-soname libandroid-shmem.so "$DEST/libandroid-shmem.so"
+          patchelf --set-rpath '$ORIGIN' "$DEST/libandroid-shmem.so" || true
+          PROOT_SRC=$(find extract -path "*/usr/bin/proot" | head -n 1)
+          cp "$PROOT_SRC" "$DEST/libproot.so"
+          patchelf --replace-needed libtalloc.so.2 libtalloc.so "$DEST/libproot.so" || true
+          patchelf --set-rpath '$ORIGIN' "$DEST/libproot.so"
+          LOADER_SRC=$(find extract -path "*/libexec/proot/loader" | head -n 1)
+          cp "$LOADER_SRC" "$DEST/libproot-loader.so"
+          chmod 755 "$DEST/"*.so*
+          for lib in libproot.so libproot-loader.so libtalloc.so libandroid-shmem.so; do
+            if [ ! -s "$DEST/$lib" ]; then echo "::error::$lib is missing from jniLibs"; exit 1; fi
+          done
+          ls -l "$DEST"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+
+      - name: Assemble Standalone APK with the Permanent Signature
+        run: |
+          gradle wrapper --gradle-version 8.7
+          ./gradlew assembleDebug --stacktrace
+          cp app/build/outputs/apk/debug/app-debug.apk PocketVSCode-arm64.apk
+          ls -lh PocketVSCode-arm64.apk
+
+      - name: Verify APK (package, version, signature)
+        run: |
+          BT=$(ls -d "${ANDROID_HOME:-$ANDROID_SDK_ROOT}"/build-tools/* 2>/dev/null | sort -V | tail -n 1)
+          if [ -z "$BT" ]; then
+            echo "Android build-tools not found on the runner - skipping APK verification."
+            exit 0
+          fi
+
+          BADGING=$("$BT/aapt2" dump badging PocketVSCode-arm64.apk 2>/dev/null | grep -m1 '^package:' || true)
+          echo "$BADGING"
+          if [ -n "$BADGING" ]; then
+            echo "$BADGING" | grep -q "name='com.pocket.vscode'" || { echo "::error::APK package id is not com.pocket.vscode"; exit 1; }
+            echo "$BADGING" | grep -q "versionCode='$VERSION_CODE'" || { echo "::error::APK versionCode is not $VERSION_CODE"; exit 1; }
+          fi
+
+          APK_SHA=$("$BT/apksigner" verify --print-certs PocketVSCode-arm64.apk 2>/dev/null | grep -m1 'certificate SHA-256 digest' | awk '{print $NF}' | tr 'A-F' 'a-f' || true)
+          KS_SHA=$(keytool -list -v -keystore app/keystore.jks -storepass android -alias androiddebugkey 2>/dev/null | grep -m1 'SHA256:' | awk '{print $2}' | tr -d ':' | tr 'A-F' 'a-f' || true)
+          echo "APK signer SHA-256      : $APK_SHA"
+          echo "Permanent keystore SHA-256: $KS_SHA"
+          if [ -n "$APK_SHA" ] && [ -n "$KS_SHA" ] && [ "$APK_SHA" != "$KS_SHA" ]; then
+            echo "::error::APK is NOT signed with the permanent keystore - updates would fail with 'App not installed'."
+            exit 1
+          fi
+
+      - name: Publish Direct APK & Keystore to GitHub Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RELEASE_TAG="v1.0.${{ github.run_number }}"
+          NOTES="Pocket VS Code ${RELEASE_TAG} (versionCode ${VERSION_CODE}). Package com.pocket.vscode, signed with the permanent keystore: installs as an in-place update. Mode 2 auto-opens, 0.5 s auto-save, 10-minute idle hibernation."
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" PocketVSCode-arm64.apk pocket-vscode-permanent.keystore --clobber
+          else
+            gh release create "$RELEASE_TAG" PocketVSCode-arm64.apk pocket-vscode-permanent.keystore \
+              --target "${{ github.sha }}" \
+              --title "Pocket VS Code ($RELEASE_TAG)" \
+              --notes "$NOTES"
+          fi
+
+      - name: Upload Artifact Backup
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Pocket-VS-Code-arm64-v8a-APK
+          path: PocketVSCode-arm64.apk
+          if-no-files-found: ignore
