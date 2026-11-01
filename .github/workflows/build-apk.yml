@@ -360,23 +360,26 @@ jobs:
           sudo du -xh --max-depth=2 "$R/usr" "$R/var" "$R/opt" "$R/root" "$R/etc" 2>/dev/null | sort -h | tail -n 25 || true
           rm -f app/src/main/assets/debian-rootfs.tar.*
 
-          # gzip first (unpacks 2-3x faster than xz on the phone). A GitHub Release file must stay below 2 GiB, so if the
-          # gzip image is too big for that, fall back to xz (smaller, slower to unpack). Sorted so /bin comes first.
+          # gzip first (unpacks 2-3x faster than xz on the phone). A GitHub Release file must stay below 2 GiB and the
+          # built APK was measured at about THREE times the size of the bundled archives (2.2 GB for 0.7 GB of assets),
+          # so when rootfs + VS Code archive are above ~650 MB the rootfs is packed with xz instead (smaller, slower to
+          # unpack). Sorted so /bin comes first.
           ASSETS=app/src/main/assets
-          MAX_GZ=1500000000
+          MAX_ASSET_BYTES=650000000
+          VSC_SIZE=$(stat -c %s "$ASSETS/vscode-linux-arm64.tar.gz")
           sudo tar --numeric-owner --sort=name -C "$R" -cf - . | pigz -9 -p "$(nproc)" > "$ASSETS/debian-rootfs.tar.gz"
           gzip -t "$ASSETS/debian-rootfs.tar.gz"
           GZ_SIZE=$(stat -c %s "$ASSETS/debian-rootfs.tar.gz")
-          echo "gzip image: $GZ_SIZE bytes"
-          if [ "$GZ_SIZE" -gt "$MAX_GZ" ]; then
-            echo "::warning::gzip image is larger than $MAX_GZ bytes - using xz so the APK stays below the 2 GiB release limit."
+          echo "gzip image: $GZ_SIZE bytes, VS Code archive: $VSC_SIZE bytes"
+          if [ $((GZ_SIZE + VSC_SIZE)) -gt "$MAX_ASSET_BYTES" ]; then
+            echo "::warning::rootfs + VS Code archives exceed $MAX_ASSET_BYTES bytes - packing the rootfs with xz so the APK stays below 2 GiB."
             rm -f "$ASSETS/debian-rootfs.tar.gz"
-            sudo tar --numeric-owner --sort=name -C "$R" -cf - . | xz -6 -T0 > "$ASSETS/debian-rootfs.tar.xz"
+            sudo tar --numeric-owner --sort=name -C "$R" -cf - . | xz -7 -T0 > "$ASSETS/debian-rootfs.tar.xz"
             xz -t "$ASSETS/debian-rootfs.tar.xz"
             XZ_SIZE=$(stat -c %s "$ASSETS/debian-rootfs.tar.xz")
             echo "xz image: $XZ_SIZE bytes"
-            if [ "$XZ_SIZE" -gt 1850000000 ]; then
-              echo "::error::The baked rootfs is still too large ($XZ_SIZE bytes). Set POCKET_DEV_TOOLS to \"0\" in this step."
+            if [ $(( (XZ_SIZE + VSC_SIZE) * 3 )) -gt 2100000000 ]; then
+              echo "::error::Even with xz the APK would be about $(( (XZ_SIZE + VSC_SIZE) * 3 )) bytes (> 2 GiB). Set POCKET_DEV_TOOLS to \"0\" in this step."
               exit 1
             fi
           fi
@@ -565,6 +568,17 @@ jobs:
           ./gradlew assembleDebug --stacktrace
           cp app/build/outputs/apk/debug/app-debug.apk PocketVSCode-arm64.apk
           ls -lh PocketVSCode-arm64.apk
+
+      - name: APK content report (largest entries)
+        if: always()
+        run: |
+          [ -f PocketVSCode-arm64.apk ] || exit 0
+          ls -l PocketVSCode-arm64.apk
+          echo "entries in the APK: $(unzip -Z1 PocketVSCode-arm64.apk | wc -l)"
+          echo "--- 15 largest entries (uncompressed bytes, compressed bytes, method, name) ---"
+          unzip -Zl PocketVSCode-arm64.apk | awk 'NF>=10 {print $4, $6, $7, $NF}' | sort -rn | head -n 15
+          echo "--- entries whose name occurs more than once ---"
+          unzip -Z1 PocketVSCode-arm64.apk | sort | uniq -d | head -n 20
 
       - name: Verify APK (package, version, signature)
         run: |
