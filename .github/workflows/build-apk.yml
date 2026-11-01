@@ -360,12 +360,11 @@ jobs:
           sudo du -xh --max-depth=2 "$R/usr" "$R/var" "$R/opt" "$R/root" "$R/etc" 2>/dev/null | sort -h | tail -n 25 || true
           rm -f app/src/main/assets/debian-rootfs.tar.*
 
-          # gzip first (unpacks 2-3x faster than xz on the phone). A GitHub Release file must stay below 2 GiB and the
-          # built APK was measured at about THREE times the size of the bundled archives (2.2 GB for 0.7 GB of assets),
-          # so when rootfs + VS Code archive are above ~650 MB the rootfs is packed with xz instead (smaller, slower to
-          # unpack). Sorted so /bin comes first.
+          # gzip first (unpacks 2-3x faster than xz on the phone). A GitHub Release file must stay below 2 GiB, so if
+          # rootfs + VS Code archive together are too big for that, the rootfs is packed with xz instead (smaller, but
+          # slower to unpack). Sorted so /bin comes first.
           ASSETS=app/src/main/assets
-          MAX_ASSET_BYTES=650000000
+          MAX_ASSET_BYTES=1700000000
           VSC_SIZE=$(stat -c %s "$ASSETS/vscode-linux-arm64.tar.gz")
           sudo tar --numeric-owner --sort=name -C "$R" -cf - . | pigz -9 -p "$(nproc)" > "$ASSETS/debian-rootfs.tar.gz"
           gzip -t "$ASSETS/debian-rootfs.tar.gz"
@@ -378,8 +377,8 @@ jobs:
             xz -t "$ASSETS/debian-rootfs.tar.xz"
             XZ_SIZE=$(stat -c %s "$ASSETS/debian-rootfs.tar.xz")
             echo "xz image: $XZ_SIZE bytes"
-            if [ $(( (XZ_SIZE + VSC_SIZE) * 3 )) -gt 2100000000 ]; then
-              echo "::error::Even with xz the APK would be about $(( (XZ_SIZE + VSC_SIZE) * 3 )) bytes (> 2 GiB). Set POCKET_DEV_TOOLS to \"0\" in this step."
+            if [ $(( XZ_SIZE + VSC_SIZE )) -gt 1900000000 ]; then
+              echo "::error::Even with xz the APK would be about $(( XZ_SIZE + VSC_SIZE )) bytes (> 2 GiB). Set POCKET_DEV_TOOLS to \"0\" in this step."
               exit 1
             fi
           fi
@@ -559,6 +558,14 @@ jobs:
           done
           ls -l "$DEST"
 
+      - name: Give the big archives a neutral file extension (the Android build unpacks *.gz assets)
+        run: |
+          cd app/src/main/assets
+          for f in debian-rootfs.tar.gz vscode-linux-arm64.tar.gz; do
+            if [ -f "$f" ]; then mv "$f" "$f.pkg"; fi
+          done
+          ls -l
+
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
 
@@ -579,6 +586,23 @@ jobs:
           unzip -Zl PocketVSCode-arm64.apk | awk 'NF>=10 {print $4, $6, $7, $NF}' | sort -rn | head -n 15
           echo "--- entries whose name occurs more than once ---"
           unzip -Z1 PocketVSCode-arm64.apk | sort | uniq -d | head -n 20
+          # Every big asset must be stored in the APK exactly as it was put into app/src/main/assets.
+          python3 -I - << 'PYEOF'
+          import os, sys, zipfile
+          z = zipfile.ZipFile("PocketVSCode-arm64.apk")
+          sizes = {i.filename: i.file_size for i in z.infolist()}
+          bad = False
+          for name in sorted(os.listdir("app/src/main/assets")):
+              path = os.path.join("app/src/main/assets", name)
+              if os.path.getsize(path) < 50_000_000:
+                  continue
+              got = sizes.get("assets/" + name)
+              print("asset", name, "on disk:", os.path.getsize(path), "in APK:", got)
+              if got != os.path.getsize(path):
+                  print("::error::assets/%s is not stored unchanged in the APK" % name)
+                  bad = True
+          sys.exit(1 if bad else 0)
+          PYEOF
 
       - name: Verify APK (package, version, signature)
         run: |
