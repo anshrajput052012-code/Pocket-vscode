@@ -23,7 +23,7 @@ env:
 jobs:
   build-arm64-apk:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
       - name: Checkout Project Source
         uses: actions/checkout@v4
@@ -164,6 +164,206 @@ jobs:
           git commit -m "chore: save permanent keystore" || true
           git push origin HEAD:${{ github.ref_name }} || true
 
+      - name: Pre-Bundle Debian Rootfs and Official VS Code
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p app/src/main/assets
+          rm -f app/src/main/assets/debian-rootfs.tar.* app/src/main/assets/vscode-linux-arm64.tar.*
+
+          # Candidate rootfs URLs, best first. Pinned to Debian bookworm: init-rootfs.sh package names match it.
+          python3 - << 'EOF' > /tmp/rootfs_urls.txt
+          import json, subprocess, sys
+          urls = []
+          try:
+              res = subprocess.run(
+                  ["gh", "api", "repos/termux/proot-distro/releases?per_page=100"],
+                  capture_output=True, text=True, timeout=120)
+              for rel in json.loads(res.stdout):
+                  for asset in rel.get("assets", []):
+                      n = asset.get("name", "")
+                      if n.startswith("debian-bookworm") and "aarch64" in n and (n.endswith(".tar.xz") or n.endswith(".tar.gz")):
+                          urls.append(asset["browser_download_url"])
+          except Exception as e:
+              print("proot-distro release lookup failed:", e, file=sys.stderr)
+          urls.append("https://raw.githubusercontent.com/debuerreotype/docker-debian-artifacts/dist-arm64v8/bookworm/rootfs.tar.xz")
+          urls.append("http://cdimage.ubuntu.com/ubuntu-base/releases/22.04/release/ubuntu-base-22.04-base-arm64.tar.gz")
+          print("\n".join(urls))
+          EOF
+
+          OK=false
+          while read -r URL; do
+            [ -z "$URL" ] && continue
+            case "$URL" in
+              *.xz) EXT=xz ;;
+              *)    EXT=gz ;;
+            esac
+            DEST="app/src/main/assets/debian-rootfs.tar.$EXT"
+            rm -f app/src/main/assets/debian-rootfs.tar.*
+            echo "Trying rootfs: $URL"
+            if curl -fL --retry 4 --retry-delay 5 --connect-timeout 30 -A "Mozilla/5.0" -o "$DEST" "$URL"; then
+              SIZE=$(stat -c %s "$DEST")
+              if [ "$SIZE" -gt 10485760 ]; then
+                if { [ "$EXT" = "xz" ] && xz -t "$DEST"; } || { [ "$EXT" = "gz" ] && gzip -t "$DEST"; }; then
+                  OK=true
+                  break
+                fi
+              fi
+            fi
+          done < /tmp/rootfs_urls.txt
+
+          if [ "$OK" != "true" ]; then
+            echo "::error::Could not download a valid Debian ARM64 rootfs from any source."
+            exit 1
+          fi
+          ls -lh app/src/main/assets/
+
+          curl -fSL --retry 4 --retry-delay 5 --connect-timeout 30 -H "User-Agent: Mozilla/5.0" \
+            "https://update.code.visualstudio.com/latest/linux-arm64/stable" \
+            -o app/src/main/assets/vscode-linux-arm64.tar.gz
+          gzip -t app/src/main/assets/vscode-linux-arm64.tar.gz
+          if [ "$(stat -c %s app/src/main/assets/vscode-linux-arm64.tar.gz)" -lt 52428800 ]; then
+            echo "::error::VS Code archive is suspiciously small."
+            exit 1
+          fi
+          ls -lh app/src/main/assets/
+
+      - name: Pre-bake the Linux environment into the rootfs (phone will not run apt)
+        env:
+          # 1 = compiler + gdb + git + python3 + nodejs/npm (default), 0 = git only (smaller, faster first start)
+          POCKET_DEV_TOOLS: "1"
+        run: |
+          set -euo pipefail
+
+          # arm64 emulation on the x86 runner (qemu-user via binfmt_misc, registered with the "fix binary" flag).
+          sudo apt-get update -qq
+          sudo apt-get install -y qemu-user-static binfmt-support pigz
+          # newer qemu than the distro package (re-registers the arm64 handler); harmless if docker is unavailable
+          docker run --privileged --rm tonistiigi/binfmt --install arm64 >/dev/null 2>&1 || true
+
+          BASE=$(ls app/src/main/assets/debian-rootfs.tar.* | head -n 1)
+          echo "Base rootfs: $BASE"
+          WORK=/tmp/bake
+          sudo rm -rf "$WORK"; mkdir -p "$WORK/extract"
+          sudo tar -xpf "$BASE" -C "$WORK/extract" --numeric-owner
+
+          # Some rootfs archives wrap everything in one directory (e.g. debian-bookworm-aarch64/).
+          R="$WORK/extract"
+          if [ ! -d "$R/etc" ]; then
+            INNER=$(find "$R" -mindepth 1 -maxdepth 1 -type d | head -n 1)
+            if [ -n "$INNER" ] && [ -d "$INNER/etc" ]; then R="$INNER"; fi
+          fi
+          [ -d "$R/etc" ] && [ -d "$R/usr" ] || { echo "::error::Unexpected rootfs layout"; sudo ls -la "$WORK/extract"; exit 1; }
+          echo "Rootfs directory: $R"
+
+          # Is arm64 emulation working?  (fallback: copy the apt qemu binary into the chroot)
+          if ! sudo chroot "$R" /bin/sh -c 'uname -m' 2>/dev/null | grep -q aarch64; then
+            echo "binfmt not active for the chroot - copying qemu-aarch64-static into the rootfs"
+            sudo cp /usr/bin/qemu-aarch64-static "$R/usr/bin/"
+            sudo update-binfmts --enable qemu-aarch64 || true
+          fi
+          sudo chroot "$R" /bin/sh -c 'uname -m' | grep -q aarch64 || { echo "::error::arm64 emulation is not working on this runner"; exit 1; }
+
+          cleanup_mounts() {
+            sudo umount -l "$R/proc" 2>/dev/null || true
+            sudo umount -l "$R/dev" 2>/dev/null || true
+          }
+          trap cleanup_mounts EXIT
+
+          sudo mkdir -p "$R/proc" "$R/dev" "$R/tmp" "$R/root"
+          sudo mount --bind /dev "$R/dev"
+          sudo mount -t proc proc "$R/proc"
+
+          # DNS for apt inside the chroot (the app rewrites resolv.conf at runtime anyway)
+          sudo rm -f "$R/etc/resolv.conf"
+          if [ -s /run/systemd/resolve/resolv.conf ]; then
+            sudo cp /run/systemd/resolve/resolv.conf "$R/etc/resolv.conf"
+          else
+            printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' | sudo tee "$R/etc/resolv.conf" >/dev/null
+          fi
+
+          # Never try to start services while packages are configured in a chroot.
+          printf '#!/bin/sh\nexit 101\n' | sudo tee "$R/usr/sbin/policy-rc.d" >/dev/null
+          sudo chmod 755 "$R/usr/sbin/policy-rc.d"
+
+          sudo cp app/src/main/assets/init-rootfs.sh "$R/tmp/init-rootfs.sh"
+          sudo chmod 755 "$R/tmp/init-rootfs.sh"
+
+          echo "=== running init-rootfs.sh inside the arm64 rootfs (POCKET_DEV_TOOLS=$POCKET_DEV_TOOLS) ==="
+          sudo chroot "$R" /usr/bin/env -i HOME=/root TERM=xterm \
+            PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            POCKET_DEV_TOOLS="$POCKET_DEV_TOOLS" \
+            /bin/bash /tmp/init-rootfs.sh
+
+          # ---- sanity: everything the app needs must be in the rootfs ----
+          missing=0
+          for f in root/.pocket-setup-done usr/bin/Xtigervnc usr/bin/openbox usr/bin/websockify usr/share/novnc usr/bin/git usr/local/bin/code root/.vscode/argv.json root/.config/Code/User/settings.json; do
+            if ! sudo test -e "$R/$f" && ! sudo test -L "$R/$f"; then echo "::error::missing in baked rootfs: /$f"; missing=1; fi
+          done
+          [ "$missing" = "0" ] || exit 1
+
+          # ---- shrink: only what is not needed at runtime ----
+          sudo rm -f "$R/usr/sbin/policy-rc.d" "$R/usr/bin/qemu-aarch64-static" "$R/tmp/init-rootfs.sh"
+          sudo chroot "$R" /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin /usr/bin/apt-get clean || true
+          sudo rm -rf "$R"/var/lib/apt/lists/* "$R"/var/cache/apt/* "$R"/var/log/* "$R"/tmp/* "$R"/root/.cache
+          sudo find "$R/usr/share/doc" -type f ! -name copyright -delete 2>/dev/null || true
+          sudo find "$R/usr/share/doc" -type d -empty -delete 2>/dev/null || true
+          sudo rm -rf "$R"/usr/share/man/* "$R"/usr/share/info/* "$R"/usr/share/lintian/* "$R"/usr/share/bug/*
+          sudo find "$R/usr/share/locale" -mindepth 1 -maxdepth 1 -type d ! -name 'en*' -exec rm -rf {} + 2>/dev/null || true
+          printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' | sudo tee "$R/etc/resolv.conf" >/dev/null
+
+          # Big hard-linked files (git, perl, ...) would be COPIED once per link on the phone: turn the extra links
+          # into relative symlinks so they cost no space and no extraction time.
+          cat > /tmp/dedupe_hardlinks.py << 'PYEOF'
+          import os, sys
+          root = sys.argv[1]
+          groups = {}
+          for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+              for fn in filenames:
+                  p = os.path.join(dirpath, fn)
+                  try:
+                      st = os.lstat(p)
+                  except OSError:
+                      continue
+                  if os.path.islink(p) or not os.path.isfile(p) or st.st_nlink < 2 or st.st_size < 131072:
+                      continue
+                  groups.setdefault((st.st_dev, st.st_ino), []).append((p, st.st_size))
+
+          def rank(item):
+              # keep the real file in a normal executable directory, with the shortest name (e.g. /usr/bin/git)
+              p = item[0]
+              rel = os.path.relpath(p, root)
+              in_bin = rel.startswith(("usr/bin/", "usr/sbin/", "bin/", "sbin/", "usr/local/bin/"))
+              return (0 if in_bin else 1, len(rel), rel)
+
+          saved = 0
+          for paths in groups.values():
+              paths.sort(key=rank)
+              keep = paths[0][0]
+              for p, size in paths[1:]:
+                  rel = os.path.relpath(keep, os.path.dirname(p))
+                  os.unlink(p)
+                  os.symlink(rel, p)
+                  saved += size
+          print("hard links turned into symlinks, bytes not duplicated on the phone:", saved)
+          PYEOF
+          sudo python3 -I /tmp/dedupe_hardlinks.py "$R"
+
+          cleanup_mounts
+          for m in proc dev; do
+            if mountpoint -q "$R/$m"; then echo "::error::$m is still mounted - refusing to archive"; exit 1; fi
+          done
+          sudo find "$R/dev" "$R/proc" -mindepth 1 -delete 2>/dev/null || true
+
+          echo "Unpacked size:"; sudo du -sh "$R"
+          rm -f app/src/main/assets/debian-rootfs.tar.*
+          # gzip (not xz): decompresses 2-3x faster on the phone. Sorted so that /bin comes first (wrapper detection).
+          sudo tar --numeric-owner --sort=name -C "$R" -cf - . | pigz -9 -p "$(nproc)" > app/src/main/assets/debian-rootfs.tar.gz
+          gzip -t app/src/main/assets/debian-rootfs.tar.gz
+          echo "baked" > app/src/main/assets/rootfs-baked.flag
+          ls -lh app/src/main/assets/
+          sudo rm -rf "$WORK"
+
       - name: Generate VS Code Icons (adaptive + legacy, all densities)
         run: |
           sudo apt-get update -qq
@@ -174,15 +374,25 @@ jobs:
           rm -rf app/src/main/res/mipmap-*/ic_launcher*
           rm -rf app/src/main/res/drawable*/ic_launcher*
 
-          # Icon source priority: 1) icon.png in the repo root (your own image)  2) official VS Code icon
+          # Icon source priority: 1) icon.png in the repo root (your own image)
+          #                       2) the BRANDED Microsoft VS Code icon inside the official tarball downloaded above
+          #                       3) generated "</>" mark (never fails the build)
+          # NOTE: microsoft/vscode/resources/linux/code.png on GitHub is the open-source "Code - OSS" artwork, NOT the
+          # official logo, so it is deliberately not used.
           rm -f vscode_icon.png
           if [ -f icon.png ]; then
             echo "Using icon.png from the repository root."
             cp icon.png vscode_icon.png
           else
-            curl -fsSL --retry 3 "https://cdn.jsdelivr.net/gh/microsoft/vscode/resources/linux/code.png" -o vscode_icon.png \
-              || curl -fsSL --retry 3 "https://raw.githubusercontent.com/microsoft/vscode/main/resources/linux/code.png" -o vscode_icon.png \
-              || echo "Icon download failed - a generated fallback icon will be used."
+            VSC_TAR=app/src/main/assets/vscode-linux-arm64.tar.gz
+            tar -tzf "$VSC_TAR" > /tmp/vscode_tar_list.txt || true
+            ICON_PATH=$(grep -m1 -E 'resources/app/resources/linux/code\.png$' /tmp/vscode_tar_list.txt || true)
+            if [ -n "$ICON_PATH" ]; then
+              echo "Using the official icon from the VS Code archive: $ICON_PATH"
+              tar -xzf "$VSC_TAR" -O "$ICON_PATH" > vscode_icon.png
+            else
+              echo "::warning::Official icon not found in the VS Code archive - a generated fallback icon will be used."
+            fi
           fi
 
           python3 - << 'EOF'
@@ -275,70 +485,6 @@ jobs:
 
           grep -q '@mipmap/ic_launcher"' app/src/main/AndroidManifest.xml || { echo "::error::Manifest does not reference @mipmap/ic_launcher"; exit 1; }
           ls app/src/main/res/mipmap-xxxhdpi app/src/main/res/mipmap-anydpi-v26
-
-      - name: Pre-Bundle Debian Rootfs and Official VS Code
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          mkdir -p app/src/main/assets
-          rm -f app/src/main/assets/debian-rootfs.tar.* app/src/main/assets/vscode-linux-arm64.tar.*
-
-          # Candidate rootfs URLs, best first. Pinned to Debian bookworm: init-rootfs.sh package names match it.
-          python3 - << 'EOF' > /tmp/rootfs_urls.txt
-          import json, subprocess, sys
-          urls = []
-          try:
-              res = subprocess.run(
-                  ["gh", "api", "repos/termux/proot-distro/releases?per_page=100"],
-                  capture_output=True, text=True, timeout=120)
-              for rel in json.loads(res.stdout):
-                  for asset in rel.get("assets", []):
-                      n = asset.get("name", "")
-                      if n.startswith("debian-bookworm") and "aarch64" in n and (n.endswith(".tar.xz") or n.endswith(".tar.gz")):
-                          urls.append(asset["browser_download_url"])
-          except Exception as e:
-              print("proot-distro release lookup failed:", e, file=sys.stderr)
-          urls.append("https://raw.githubusercontent.com/debuerreotype/docker-debian-artifacts/dist-arm64v8/bookworm/rootfs.tar.xz")
-          urls.append("http://cdimage.ubuntu.com/ubuntu-base/releases/22.04/release/ubuntu-base-22.04-base-arm64.tar.gz")
-          print("\n".join(urls))
-          EOF
-
-          OK=false
-          while read -r URL; do
-            [ -z "$URL" ] && continue
-            case "$URL" in
-              *.xz) EXT=xz ;;
-              *)    EXT=gz ;;
-            esac
-            DEST="app/src/main/assets/debian-rootfs.tar.$EXT"
-            rm -f app/src/main/assets/debian-rootfs.tar.*
-            echo "Trying rootfs: $URL"
-            if curl -fL --retry 4 --retry-delay 5 --connect-timeout 30 -A "Mozilla/5.0" -o "$DEST" "$URL"; then
-              SIZE=$(stat -c %s "$DEST")
-              if [ "$SIZE" -gt 10485760 ]; then
-                if { [ "$EXT" = "xz" ] && xz -t "$DEST"; } || { [ "$EXT" = "gz" ] && gzip -t "$DEST"; }; then
-                  OK=true
-                  break
-                fi
-              fi
-            fi
-          done < /tmp/rootfs_urls.txt
-
-          if [ "$OK" != "true" ]; then
-            echo "::error::Could not download a valid Debian ARM64 rootfs from any source."
-            exit 1
-          fi
-          ls -lh app/src/main/assets/
-
-          curl -fSL --retry 4 --retry-delay 5 --connect-timeout 30 -H "User-Agent: Mozilla/5.0" \
-            "https://update.code.visualstudio.com/latest/linux-arm64/stable" \
-            -o app/src/main/assets/vscode-linux-arm64.tar.gz
-          gzip -t app/src/main/assets/vscode-linux-arm64.tar.gz
-          if [ "$(stat -c %s app/src/main/assets/vscode-linux-arm64.tar.gz)" -lt 52428800 ]; then
-            echo "::error::VS Code archive is suspiciously small."
-            exit 1
-          fi
-          ls -lh app/src/main/assets/
 
       - name: Fetch and Patch ARM64 Binaries
         run: |
