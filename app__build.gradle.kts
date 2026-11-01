@@ -37,8 +37,10 @@ android {
 
     // The bundled Debian rootfs / VS Code archives are already compressed: store them as-is. This keeps the
     // APK build fast and lets the app read the exact asset size for the real progress percentage.
+    // ("pkg" = the CI renames the .tar.gz archives to *.tar.gz.pkg because the Android build silently UNPACKS assets
+    // that end in ".gz", which made the APK 2.2 GB instead of 0.7 GB.)
     androidResources {
-        noCompress.addAll(listOf("xz", "gz", "tar"))
+        noCompress.addAll(listOf("xz", "gz", "tar", "pkg"))
     }
 
     packaging {
