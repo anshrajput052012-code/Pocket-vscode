@@ -58,7 +58,21 @@ class AppPrefs(context: Context) {
             sp.edit().putBoolean("asked_notif", value).apply()
         }
 
+    /** Mode 1 screen quality: [QUALITY_BALANCED], [QUALITY_SHARP] (default) or [QUALITY_NATIVE]. */
+    var mode1Quality: String
+        get() = when (val v = sp.getString("mode1_quality", QUALITY_SHARP) ?: QUALITY_SHARP) {
+            QUALITY_BALANCED, QUALITY_SHARP, QUALITY_NATIVE -> v
+            else -> QUALITY_SHARP
+        }
+        set(value) {
+            sp.edit().putString("mode1_quality", value).apply()
+        }
+
     companion object {
+        const val QUALITY_BALANCED = "balanced"
+        const val QUALITY_SHARP = "sharp"
+        const val QUALITY_NATIVE = "native"
+
         fun defaultWorkspace(): String =
             File(Environment.getExternalStorageDirectory(), "VSCodeProjects").absolutePath
     }
@@ -317,6 +331,19 @@ class ProotProcessManager(context: Context) {
             if (Files.isSymbolicLink(f.toPath())) Files.delete(f.toPath())
             f.writeText(text)
         } catch (_: Exception) {
+        }
+    }
+
+    /**
+     * Mode 1: tells the start script which virtual screen size to use (read from /root/.pocket-geometry).
+     * Takes effect the next time Mode 1 is started.
+     */
+    fun writeMode1Geometry(width: Int, height: Int) {
+        try {
+            homeDir.mkdirs()
+            File(homeDir, ".pocket-geometry").writeText("${width}x${height}\n")
+        } catch (e: Exception) {
+            AppLog.add("Warning: could not store the Mode 1 screen size: ${e.message}")
         }
     }
 

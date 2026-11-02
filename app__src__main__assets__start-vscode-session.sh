@@ -1,7 +1,7 @@
 #!/bin/bash
 # Pocket VS Code — session launcher (runs INSIDE the PRoot Debian ARM64 rootfs).
 #
-#   x11    : Mode 1 — Xtigervnc :1 (1920x1080) + Openbox + noVNC + full Electron VS Code Desktop.
+#   x11    : Mode 1 — Xtigervnc :1 (size chosen in the app, see GEOMETRY) + Openbox + noVNC + full Electron VS Code Desktop.
 #            Never throttled, no watcher.
 #   direct : Mode 2 — official `code serve-web` on 127.0.0.1:8080 with the battery saver:
 #            the app refreshes /tmp/.pocket-mode2-heartbeat while a Mode 2 window is open; when it has not been
@@ -98,9 +98,17 @@ pkill -9 -f openbox 2>/dev/null
 rm -rf /tmp/.X1-lock /tmp/.X11-unix/X1
 sleep 1
 
-echo "[start-vscode] Starting Embedded X11 Server (Xtigervnc :1) & Openbox Window Manager..."
+# Screen size of the virtual desktop. The app writes the user's choice (Balanced 1440x900 / Sharp 1920x1200 /
+# Native = the tablet's own size) to /root/.pocket-geometry before every Mode 1 start. Bigger = sharper but heavier.
+GEOMETRY="1920x1200"
+if [ -f /root/.pocket-geometry ]; then
+    CUSTOM="$(tr -d ' \r\n' < /root/.pocket-geometry)"
+    if printf '%s' "$CUSTOM" | grep -Eq '^[0-9]{3,4}x[0-9]{3,4}$'; then GEOMETRY="$CUSTOM"; fi
+fi
+
+echo "[start-vscode] Starting Embedded X11 Server (Xtigervnc :1, $GEOMETRY) & Openbox Window Manager..."
 Xtigervnc :1 \
-    -geometry 1920x1080 \
+    -geometry "$GEOMETRY" \
     -depth 24 \
     -localhost \
     -SecurityTypes None \

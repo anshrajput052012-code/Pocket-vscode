@@ -1,15 +1,18 @@
 # Pocket VS Code — genuine VS Code (linux-arm64) inside one Android APK, no Termux
 
-Package id: **`com.pocket.vscode`** (locked). Every build is signed with the same permanent keystore and gets
+Package id: **`com.anshrajput.pocketvscode`** (locked). Every build is signed with the same permanent keystore and gets
 `versionCode = GitHub run number + VERSION_CODE_OFFSET` (offset is set at the top of the workflow, default `1000`),
 so a new APK always installs as an **in-place update** (no uninstall, no "App not installed").
 
 ## What the user sees
-1. **Step 1 – pick a project folder.** The moment a folder is chosen, the app extracts the bundled Debian ARM64
-   rootfs and the official Microsoft VS Code, then configures the environment — automatically, in a background
-   service, with a live **0 % → 100 %** progress screen. Closing the app mid-way is safe: it resumes on next start.
+1. **Step 1 – pick a project folder.** The moment a folder is chosen, the app unpacks the bundled Debian ARM64
+   rootfs and the official Microsoft VS Code — automatically, in a background service, with a live **0 % → 100 %**
+   progress screen. Everything else (X11/VNC, git, compilers, Python, Node.js …) is **already installed inside the
+   bundled rootfs by the GitHub Actions build**, so the phone needs **no internet and no apt** and the first start
+   takes only the unpacking time (a minute or two instead of ~20 min). Closing the app mid-way is safe: it resumes on
+   next start.
 2. **Launch** one of two modes:
-   * **Mode 1 – Full Electron Desktop**: Xtigervnc `:1` (1920x1080) + Openbox + `/opt/vscode-arm64/bin/code --no-sandbox --disable-gpu`
+   * **Mode 1 – Full Electron Desktop**: Xtigervnc `:1` (screen size chosen in the app: **Balanced** 1440x900 / **Sharp** 1920x1200 (default) / **Native** = this screen's own size) + Openbox + `/opt/vscode-arm64/bin/code --no-sandbox --disable-gpu`
      shown through noVNC. Not throttled.
    * **Mode 2 – High-FPS native web host**: `code serve-web` on `127.0.0.1:8080`. As soon as the port answers, the
      workbench opens by itself in a full-screen in-app WebView (`WorkbenchActivity`, `domStorage` on); if the WebView
@@ -22,7 +25,9 @@ Files are stored flat, with `__` standing for `/` (e.g. `app__src__main__Android
 `app/src/main/AndroidManifest.xml`). The workflow restores the real folder structure. Upload **all** `app__*`
 files, the workflow, and `app/keystore.jks`.
 
-* `icon.png` (optional, repo root): your own launcher icon. If absent, the workflow downloads the official VS Code icon.
+* `icon.png` (optional, repo root): your own launcher icon. If absent, the workflow takes the **official, branded
+  Microsoft VS Code icon from inside the VS Code archive it already downloads** (the `code.png` in the open-source
+  GitHub repo is the "Code - OSS" artwork, not the real logo, so it is not used).
 * `app/keystore.jks`: the permanent signing key (also saved to every GitHub Release as `pocket-vscode-permanent.keystore`).
 
 ## Moving to a NEW repository (keeps in-place updates working)
@@ -42,6 +47,17 @@ Push to `main` (or run the workflow manually): *Actions → Build Standalone VS 
 **Releases**. Local builds additionally need `fetch-native-proot.sh`, the bundled assets and generated icons, so the
 GitHub Actions build is the supported path.
 
+## How the fast first start works (CI "pre-bake")
+The workflow downloads the Debian arm64 rootfs, runs `app/src/main/assets/init-rootfs.sh` inside it on the GitHub
+runner (arm64 emulation via qemu), trims docs/man pages/locales/apt caches, turns big hard-linked files into symlinks,
+and packs the result as `debian-rootfs.tar.gz` (gzip unpacks much faster than xz) plus a `rootfs-baked.flag` marker.
+The CI build takes longer (qemu), the phone is much faster.
+
+* `POCKET_DEV_TOOLS` (env of the *Pre-bake* step in `.github/workflows/build-apk.yml`): `"1"` = compiler, gdb, git,
+  Python, Node.js/npm (default); `"0"` = git only → smaller APK and faster unpacking; add tools later in the VS Code
+  terminal with `apt install …`.
+* If a rootfs without the baked marker is ever used, the app falls back to running `init-rootfs.sh` with apt on the
+  phone (needs internet once), exactly as before.
+
 ## Network notes
-* First-run setup step 3/3 runs `apt-get` inside the rootfs → needs internet **once**.
 * The first Mode 2 start may download the matching VS Code web server build (done by `code serve-web` itself).

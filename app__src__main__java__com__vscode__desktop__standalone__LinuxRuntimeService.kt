@@ -124,7 +124,7 @@ class LinuxRuntimeService : Service() {
 
     companion object {
         const val CHANNEL_ID = "vscode_standalone_runtime"
-        const val ACTION_STOP = "com.pocket.vscode.STOP"
+        const val ACTION_STOP = "com.anshrajput.pocketvscode.STOP"
         const val EXTRA_MODE = "mode"
         const val MODE_PROVISION = "provision"
         const val MODE_X11 = "x11"

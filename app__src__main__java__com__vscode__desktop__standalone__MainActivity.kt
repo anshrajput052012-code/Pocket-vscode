@@ -27,7 +27,6 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Button
 import android.widget.FrameLayout
-import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.RadioButton
@@ -48,7 +47,7 @@ import java.io.File
  *   LOADING : the moment a folder is chosen, Debian + VS Code are extracted from the APK and the environment is set
  *             up in a background thread, with a live 0-100 % progress bar
  *   READY   : choose Mode 1 (full Electron desktop) or Mode 2 (native web host) and launch
- *   MODE1   : embedded noVNC surface with a touch keybar (Mode 2 opens in WorkbenchActivity)
+ *   MODE1   : embedded noVNC surface (Back returns to READY; Mode 2 opens in WorkbenchActivity)
  */
 class MainActivity : AppCompatActivity(), ProvisionListener {
 
@@ -72,6 +71,8 @@ class MainActivity : AppCompatActivity(), ProvisionListener {
 
     private lateinit var readyFolderLabel: TextView
     private lateinit var modeGroup: RadioGroup
+    private lateinit var qualityBox: LinearLayout
+    private lateinit var qualityGroup: RadioGroup
     private lateinit var launchButton: Button
     private lateinit var verifyButton: Button
     private lateinit var statusText: TextView
@@ -211,6 +212,7 @@ class MainActivity : AppCompatActivity(), ProvisionListener {
             "direct" -> modeGroup.check(ID_MODE2)
             else -> modeGroup.check(ID_MODE1)
         }
+        qualityBox.visibility = if (modeGroup.checkedRadioButtonId == ID_MODE2) View.GONE else View.VISIBLE
         launchButton.isEnabled = true
         launchButton.alpha = 1f
         statusText.text = "Setup complete · 100%. Choose a mode and launch."
@@ -344,11 +346,14 @@ class MainActivity : AppCompatActivity(), ProvisionListener {
         statusText.text = "Starting Mode 1 (Xtigervnc + Openbox + VS Code)…"
         LinuxRuntimeService.start(this, LinuxRuntimeService.MODE_X11)
 
+        val (screenW, screenH) = mode1ScreenSize()
+
         Thread({
             var started: Process? = null
             var errorMessage: String? = null
             try {
                 Mode1Session.stop()
+                prootManager.writeMode1Geometry(screenW, screenH)
                 val p = prootManager.startProotCommand(
                     command = "bash /root/start-vscode-session.sh x11",
                     workspaceHostPath = workspace,
@@ -407,13 +412,12 @@ class MainActivity : AppCompatActivity(), ProvisionListener {
     private fun showMode1Surface() {
         val wv: WebView = mode1WebView ?: createMode1WebView() ?: return
         mode1WebView = wv
+        val firstShow = currentScreen != Screen.MODE1
         showScreen(Screen.MODE1)
-        wv.loadUrl("http://127.0.0.1:6080/vnc.html?autoconnect=true&resize=remote")
-    }
-
-    private fun injectKeyIntoWorkbench(keySpec: String) {
-        val js = "window.dispatchEvent(new KeyboardEvent('keydown', {key: '$keySpec', bubbles: true}));"
-        mode1WebView?.evaluateJavascript(js, null)
+        if (firstShow) Toast.makeText(this, "Back = Setup / Logs", Toast.LENGTH_SHORT).show()
+        // resize=scale: keep the fixed (light) server resolution and let the WebView scale it. "remote" would make the
+        // server grow to the tablet's full pixel size, which is much heavier. Local loopback: low compression = less CPU.
+        wv.loadUrl("http://127.0.0.1:6080/vnc.html?autoconnect=true&resize=scale&quality=6&compression=2")
     }
 
     private fun runVerification() {
@@ -480,6 +484,29 @@ class MainActivity : AppCompatActivity(), ProvisionListener {
     // ---------------------------------------------------------------------------------------------
     // UI construction (programmatic, VS Code dark theme)
     // ---------------------------------------------------------------------------------------------
+
+    private fun qualityRadio(radioId: Int, label: String): RadioButton = RadioButton(this).apply {
+        id = radioId
+        text = label
+        setTextColor(TEXT)
+        buttonTintList = ColorStateList.valueOf(ACCENT)
+    }
+
+    /** This screen's pixel size as a landscape size, rounded so the VNC server accepts it (width % 8, height % 2). */
+    private fun nativeScreenSize(): Pair<Int, Int> {
+        val dm = resources.displayMetrics
+        var w = maxOf(dm.widthPixels, dm.heightPixels)
+        var h = minOf(dm.widthPixels, dm.heightPixels)
+        w = (w.coerceIn(800, 2560) / 8) * 8
+        h = (h.coerceIn(500, 1600) / 2) * 2
+        return w to h
+    }
+
+    private fun mode1ScreenSize(): Pair<Int, Int> = when (prefs.mode1Quality) {
+        AppPrefs.QUALITY_BALANCED -> 1440 to 900
+        AppPrefs.QUALITY_NATIVE -> nativeScreenSize()
+        else -> 1920 to 1200
+    }
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
@@ -621,6 +648,39 @@ class MainActivity : AppCompatActivity(), ProvisionListener {
         }
         readyColumn.addView(modeGroup)
 
+        val (nativeW, nativeH) = nativeScreenSize()
+        qualityBox = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, dp(14), 0, 0)
+        }
+        qualityBox.addView(makeText("Mode 1 screen quality (used the next time Mode 1 starts):", 12f, MUTED))
+        qualityGroup = RadioGroup(this).apply {
+            orientation = RadioGroup.VERTICAL
+            addView(qualityRadio(ID_Q_BALANCED, "Balanced · 1440×900\nlighter, text a little soft"))
+            addView(qualityRadio(ID_Q_SHARP, "Sharp · 1920×1200\nclearer text"))
+            addView(qualityRadio(ID_Q_NATIVE, "Native · ${nativeW}×${nativeH}\nthis screen's own size: sharpest, heaviest"))
+        }
+        qualityGroup.check(
+            when (prefs.mode1Quality) {
+                AppPrefs.QUALITY_BALANCED -> ID_Q_BALANCED
+                AppPrefs.QUALITY_NATIVE -> ID_Q_NATIVE
+                else -> ID_Q_SHARP
+            }
+        )
+        qualityGroup.setOnCheckedChangeListener { _, id ->
+            prefs.mode1Quality = when (id) {
+                ID_Q_BALANCED -> AppPrefs.QUALITY_BALANCED
+                ID_Q_NATIVE -> AppPrefs.QUALITY_NATIVE
+                else -> AppPrefs.QUALITY_SHARP
+            }
+        }
+        qualityBox.addView(qualityGroup)
+        readyColumn.addView(qualityBox)
+        // the quality only matters for Mode 1
+        modeGroup.setOnCheckedChangeListener { _, id ->
+            qualityBox.visibility = if (id == ID_MODE2) View.GONE else View.VISIBLE
+        }
+
         launchButton = makeButton("Launch VS Code", primary = true) { launchSelected() }
         readyColumn.addView(launchButton)
         verifyButton = makeButton("Verify installation (VS Code, Git, node-pty, extensions)", primary = false) { runVerification() }
@@ -637,35 +697,6 @@ class MainActivity : AppCompatActivity(), ProvisionListener {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
         }
-        val keyBarScroll = HorizontalScrollView(this).apply { setBackgroundColor(0xFF252526.toInt()) }
-        val keyBar = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(dp(4), dp(2), dp(4), dp(2))
-        }
-        val keys = listOf(
-            "ESC" to "Escape",
-            "TAB" to "Tab",
-            "Cmd Palette (F1)" to "F1",
-            "Quick Open" to "Control+P",
-            "Terminal" to "Control+Backquote",
-            "Save" to "Control+S",
-            "Find" to "Control+F",
-            "Setup / Logs" to "SWITCH_PANEL"
-        )
-        for ((label, action) in keys) {
-            val btn = Button(this).apply {
-                text = label
-                textSize = 11f
-                isAllCaps = false
-                setOnClickListener {
-                    if (action == "SWITCH_PANEL") showReady() else injectKeyIntoWorkbench(action)
-                }
-            }
-            keyBar.addView(btn)
-        }
-        keyBarScroll.addView(keyBar)
-        mode1Container.addView(keyBarScroll)
-
         for (v in listOf<View>(folderScreen, loadingScreen, readyScreen, mode1Container)) {
             v.layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
             rootFrame.addView(v)
@@ -676,6 +707,9 @@ class MainActivity : AppCompatActivity(), ProvisionListener {
     companion object {
         private const val ID_MODE1 = 1001
         private const val ID_MODE2 = 1002
+        private const val ID_Q_BALANCED = 1101
+        private const val ID_Q_SHARP = 1102
+        private const val ID_Q_NATIVE = 1103
         private const val BG = 0xFF1E1E1E.toInt()
         private const val ACCENT = 0xFF007ACC.toInt()
         private const val TEXT = 0xFFD4D4D4.toInt()

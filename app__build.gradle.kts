@@ -9,7 +9,7 @@ android {
 
     defaultConfig {
         // LOCKED FOREVER: changing this makes Android treat the APK as a different app (no in-place update).
-        applicationId = "com.pocket.vscode"
+        applicationId = "com.anshrajput.pocketvscode"
         minSdk = 26
         targetSdk = 34
         // CI overwrites versionCode with the GitHub run number (monotonic) and versionName with 1.0.<run number>.
