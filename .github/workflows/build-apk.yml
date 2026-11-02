@@ -96,18 +96,18 @@ jobs:
             fi
           done
 
-      - name: Lock Package ID (com.pocket.vscode) and Auto-Increment Version
+      - name: Lock Package ID (com.anshrajput.pocketvscode) and Auto-Increment Version
         run: |
           VERSION_CODE=$(( ${{ github.run_number }} + ${VERSION_CODE_OFFSET:-0} ))
           echo "VERSION_CODE=$VERSION_CODE" >> "$GITHUB_ENV"
 
           # applicationId is also hard-coded in app/build.gradle.kts; this keeps it locked even if that file is replaced.
-          find app -name "build.gradle.kts" -exec sed -i 's/applicationId = "[^"]*"/applicationId = "com.pocket.vscode"/g' {} +
+          find app -name "build.gradle.kts" -exec sed -i 's/applicationId = "[^"]*"/applicationId = "com.anshrajput.pocketvscode"/g' {} +
           # versionCode always increases -> every new APK installs as an UPDATE, no uninstall needed.
           find app -name "build.gradle.kts" -exec sed -i "s/versionCode = [0-9]*/versionCode = $VERSION_CODE/g" {} +
           find app -name "build.gradle.kts" -exec sed -i 's/versionName = "[^"]*"/versionName = "1.0.${{ github.run_number }}"/g' {} +
 
-          grep -q 'applicationId = "com.pocket.vscode"' app/build.gradle.kts || { echo "::error::applicationId is not locked to com.pocket.vscode"; exit 1; }
+          grep -q 'applicationId = "com.anshrajput.pocketvscode"' app/build.gradle.kts || { echo "::error::applicationId is not locked to com.anshrajput.pocketvscode"; exit 1; }
           grep -q "versionCode = $VERSION_CODE\$" app/build.gradle.kts || { echo "::error::versionCode was not set to $VERSION_CODE"; exit 1; }
           grep -n 'applicationId\|versionCode\|versionName' app/build.gradle.kts
 
@@ -615,7 +615,7 @@ jobs:
           BADGING=$("$BT/aapt2" dump badging PocketVSCode-arm64.apk 2>/dev/null | grep -m1 '^package:' || true)
           echo "$BADGING"
           if [ -n "$BADGING" ]; then
-            echo "$BADGING" | grep -q "name='com.pocket.vscode'" || { echo "::error::APK package id is not com.pocket.vscode"; exit 1; }
+            echo "$BADGING" | grep -q "name='com.anshrajput.pocketvscode'" || { echo "::error::APK package id is not com.anshrajput.pocketvscode"; exit 1; }
             echo "$BADGING" | grep -q "versionCode='$VERSION_CODE'" || { echo "::error::APK versionCode is not $VERSION_CODE"; exit 1; }
           fi
 
@@ -633,7 +633,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           RELEASE_TAG="v1.0.${{ github.run_number }}"
-          NOTES="Pocket VS Code ${RELEASE_TAG} (versionCode ${VERSION_CODE}). Package com.pocket.vscode, signed with the permanent keystore: installs as an in-place update. Mode 2 auto-opens, 0.5 s auto-save, 10-minute idle hibernation."
+          NOTES="Pocket VS Code ${RELEASE_TAG} (versionCode ${VERSION_CODE}). Package com.anshrajput.pocketvscode, signed with the permanent keystore: installs as an in-place update. Mode 2 auto-opens, 0.5 s auto-save, 10-minute idle hibernation."
           # The keystore always goes first (it is tiny and is the key to future updates).
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" pocket-vscode-permanent.keystore --clobber
