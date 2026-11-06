@@ -8,9 +8,22 @@ on:
 permissions:
   contents: write
 
+# One build at a time: run_number (versionCode), the keystore commit and the release tag must not race.
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # versionCode = run number + this offset. A NEW repository restarts the run number at 1, and Android refuses to
+  # install a lower versionCode over a higher one ("App not installed"). 1000 keeps every build of a new repo above
+  # all builds made in the old one (highest there: 29). Use 0 only in a repository whose run numbers already are
+  # above anything installed. Never lower this once builds with it were installed.
+  VERSION_CODE_OFFSET: "1000"
+
 jobs:
   build-arm64-apk:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
       - name: Checkout Project Source
         uses: actions/checkout@v4
@@ -23,222 +36,110 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Unpack Flattened Repo Files (app__*) Without Changing App Code
+      - name: Restore Folder Structure and Root Configs
         run: |
           for f in app__*; do
             if [ -f "$f" ]; then
               target=$(echo "$f" | sed 's/__/\//g')
               mkdir -p "$(dirname "$target")"
-              cp -f "$f" "$target"
+              mv "$f" "$target"
             fi
           done
 
-      - name: Fix APK Install Flags (useLegacyPackaging, extractNativeLibs, VersionCode & Package ID)
-        run: |
-          python3 - << 'EOF'
-          import os, re
-
-          # 1. Patch app/build.gradle.kts for APK installation compatibility
-          gradle_path = "app/build.gradle.kts"
-          if os.path.exists(gradle_path):
-              with open(gradle_path, "r", encoding="utf-8") as f:
-                  g = f.read()
-
-              # Set clean applicationId to avoid conflict with old repo installs, keeping namespace intact
-              g = re.sub(r'applicationId\s*=\s*"[^"]*"', 'applicationId = "com.pocket.vscode.ide"', g)
-
-              # Bump versionCode to 2000 + run_number so Android never blocks for version downgrade
-              run_num = int(os.environ.get("GITHUB_RUN_NUMBER", "1"))
-              ver_code = 2000 + run_num
-              g = re.sub(r'versionCode\s*=\s*\d+', f'versionCode = {ver_code}', g)
-
-              # Add useLegacyPackaging = true (Mandatory for patchelf-modified libproot.so) and noCompress for tar/xz/gz
-              packaging_block = """
-              packaging {
-                  jniLibs {
-                      useLegacyPackaging = true
-                  }
+          cat > settings.gradle.kts << 'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
               }
-              androidResources {
-                  noCompress += listOf("xz", "gz", "tar", "so", "bin")
-              }
-              """
-              if "useLegacyPackaging" not in g:
-                  g = re.sub(r'(android\s*\{)', r'\1\n' + packaging_block, g, count=1)
-
-              with open(gradle_path, "w", encoding="utf-8") as f:
-                  f.write(g)
-
-          # 2. Patch AndroidManifest.xml to ensure extractNativeLibs="true" and valid exported flags
-          manifest_path = "app/src/main/AndroidManifest.xml"
-          if os.path.exists(manifest_path):
-              with open(manifest_path, "r", encoding="utf-8") as f:
-                  m = f.read()
-
-              m = re.sub(r'android:testOnly="[^"]*"', '', m)
-              if 'android:extractNativeLibs=' in m:
-                  m = re.sub(r'android:extractNativeLibs="[^"]*"', 'android:extractNativeLibs="true"', m)
-              else:
-                  m = re.sub(r'<application', '<application android:extractNativeLibs="true"', m, count=1)
-
-              with open(manifest_path, "w", encoding="utf-8") as f:
-                  f.write(m)
-          EOF
-
-      - name: Generate Official VS Code Launcher Icons (If Not Present in res/mipmap)
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y python3-pil curl
-
-          rm -rf app/src/main/res/mipmap-anydpi*
-          curl -fSL "https://raw.githubusercontent.com/microsoft/vscode/main/resources/linux/code.png" -o vscode_icon.png
-
-          python3 - << 'EOF'
-          import os, re
-          from PIL import Image, ImageDraw
-
-          img = Image.open("vscode_icon.png").convert("RGBA")
-          sizes = {
-              "mipmap-mdpi": 48,
-              "mipmap-hdpi": 72,
-              "mipmap-xhdpi": 96,
-              "mipmap-xxhdpi": 144,
-              "mipmap-xxxhdpi": 192
           }
-
-          for folder, size in sizes.items():
-              dest_dir = os.path.join("app/src/main/res", folder)
-              os.makedirs(dest_dir, exist_ok=True)
-
-              card = Image.new("RGBA", (size, size), (30, 30, 30, 255))
-              inner = int(size * 0.76)
-              logo = img.resize((inner, inner), Image.Resampling.LANCZOS)
-              off = (size - inner) // 2
-              card.paste(logo, (off, off), logo)
-              card.save(os.path.join(dest_dir, "ic_launcher.png"))
-
-              mask = Image.new("L", (size, size), 0)
-              draw = ImageDraw.Draw(mask)
-              draw.ellipse((0, 0, size - 1, size - 1), fill=255)
-              round_card = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-              round_card.paste(card, (0, 0), mask)
-              round_card.save(os.path.join(dest_dir, "ic_launcher_round.png"))
-
-          manifest_path = "app/src/main/AndroidManifest.xml"
-          if os.path.exists(manifest_path):
-              with open(manifest_path, "r", encoding="utf-8") as f:
-                  c = f.read()
-              if 'android:icon=' in c:
-                  c = re.sub(r'android:icon="[^"]*"', 'android:icon="@mipmap/ic_launcher"', c)
-              else:
-                  c = re.sub(r'<application', '<application android:icon="@mipmap/ic_launcher"', c, count=1)
-              if 'android:roundIcon=' in c:
-                  c = re.sub(r'android:roundIcon="[^"]*"', 'android:roundIcon="@mipmap/ic_launcher_round"', c)
-              else:
-                  c = re.sub(r'<application', '<application android:roundIcon="@mipmap/ic_launcher_round"', c, count=1)
-              with open(manifest_path, "w", encoding="utf-8") as f:
-                  f.write(c)
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "PocketVSCode"
+          include(":app")
           EOF
 
-      - name: Run Repo fetch-native-proot.sh & Bundle Offline Assets
+          cat > build.gradle.kts << 'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+
+          cat > gradle.properties << 'EOF'
+          org.gradle.jvmargs=-Xmx4096m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          android.nonTransitiveRClass=true
+          EOF
+
+          for need in app/build.gradle.kts app/src/main/AndroidManifest.xml \
+                      app/src/main/java/com/vscode/desktop/standalone/MainActivity.kt \
+                      app/src/main/java/com/vscode/desktop/standalone/WorkbenchActivity.kt \
+                      app/src/main/java/com/vscode/desktop/standalone/StandaloneProvisioner.kt \
+                      app/src/main/java/com/vscode/desktop/standalone/ProotProcessManager.kt \
+                      app/src/main/java/com/vscode/desktop/standalone/LinuxRuntimeService.kt \
+                      app/src/main/assets/start-vscode-session.sh \
+                      app/src/main/assets/init-rootfs.sh \
+                      app/src/main/res/values/strings.xml \
+                      app/src/main/res/values/colors.xml \
+                      app/src/main/res/drawable/ic_stat_vscode.xml; do
+            if [ ! -f "$need" ]; then
+              echo "::error::Missing project file after restore: $need (upload every app__* file from the repo)"
+              exit 1
+            fi
+          done
+
+      - name: Lock Package ID (com.anshrajput.pocketvscode) and Auto-Increment Version
+        run: |
+          VERSION_CODE=$(( ${{ github.run_number }} + ${VERSION_CODE_OFFSET:-0} ))
+          echo "VERSION_CODE=$VERSION_CODE" >> "$GITHUB_ENV"
+
+          # applicationId is also hard-coded in app/build.gradle.kts; this keeps it locked even if that file is replaced.
+          find app -name "build.gradle.kts" -exec sed -i 's/applicationId = "[^"]*"/applicationId = "com.anshrajput.pocketvscode"/g' {} +
+          # versionCode always increases -> every new APK installs as an UPDATE, no uninstall needed.
+          find app -name "build.gradle.kts" -exec sed -i "s/versionCode = [0-9]*/versionCode = $VERSION_CODE/g" {} +
+          find app -name "build.gradle.kts" -exec sed -i 's/versionName = "[^"]*"/versionName = "1.0.${{ github.run_number }}"/g' {} +
+
+          grep -q 'applicationId = "com.anshrajput.pocketvscode"' app/build.gradle.kts || { echo "::error::applicationId is not locked to com.anshrajput.pocketvscode"; exit 1; }
+          grep -q "versionCode = $VERSION_CODE\$" app/build.gradle.kts || { echo "::error::versionCode was not set to $VERSION_CODE"; exit 1; }
+          grep -n 'applicationId\|versionCode\|versionName' app/build.gradle.kts
+
+      - name: Restore or Generate Permanent Signing Keystore
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y patchelf binutils curl
+          mkdir -p ~/.android app /tmp/keystore_dl
+          RESTORED=false
 
-          if [ -f "fetch-native-proot.sh" ]; then
-            chmod +x fetch-native-proot.sh
-            ./fetch-native-proot.sh || true
-          fi
-
-          DEST="$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a"
-          mkdir -p "$DEST"
-          if [ ! -f "$DEST/libproot.so" ]; then
-            mkdir -p /tmp/debs
-            cd /tmp/debs
-            PACKAGES_URL="https://packages.termux.dev/apt/termux-main/dists/stable/main/binary-aarch64/Packages"
-            curl -sL "$PACKAGES_URL" -o Packages
-            PROOT_DEB_PATH=$(awk '/^Package: proot$/,/^$/' Packages | grep '^Filename:' | head -n 1 | awk '{print $2}')
-            TALLOC_DEB_PATH=$(awk '/^Package: libtalloc$/,/^$/' Packages | grep '^Filename:' | head -n 1 | awk '{print $2}')
-            SHMEM_DEB_PATH=$(awk '/^Package: libandroid-shmem$/,/^$/' Packages | grep '^Filename:' | head -n 1 | awk '{print $2}')
-            if [ -z "$SHMEM_DEB_PATH" ]; then
-              SHMEM_DEB_PATH=$(grep -E 'libandroid-shmem.*_aarch64\.deb' Packages | head -n 1 | awk '{print $2}')
-            fi
-            curl -sL "https://packages.termux.dev/apt/termux-main/$PROOT_DEB_PATH" -o proot.deb
-            curl -sL "https://packages.termux.dev/apt/termux-main/$TALLOC_DEB_PATH" -o talloc.deb
-            curl -sL "https://packages.termux.dev/apt/termux-main/$SHMEM_DEB_PATH" -o shmem.deb
-            mkdir -p extract
-            for f in proot.deb talloc.deb shmem.deb; do
-              mkdir -p "extract/$f"
-              cd "extract/$f"
-              ar x "/tmp/debs/$f"
-              tar -xf data.tar.*
-              cd /tmp/debs
-            done
-            TALLOC_SRC=$(find extract -name "libtalloc.so*" | head -n 1)
-            cp "$TALLOC_SRC" "$DEST/libtalloc.so"
-            patchelf --set-soname libtalloc.so "$DEST/libtalloc.so"
-            patchelf --set-rpath '$ORIGIN' "$DEST/libtalloc.so" || true
-            SHMEM_SRC=$(find extract -name "libandroid-shmem.so*" | head -n 1)
-            cp "$SHMEM_SRC" "$DEST/libandroid-shmem.so"
-            patchelf --set-soname libandroid-shmem.so "$DEST/libandroid-shmem.so"
-            patchelf --set-rpath '$ORIGIN' "$DEST/libandroid-shmem.so" || true
-            PROOT_SRC=$(find extract -path "*/usr/bin/proot" | head -n 1)
-            cp "$PROOT_SRC" "$DEST/libproot.so"
-            patchelf --replace-needed libtalloc.so.2 libtalloc.so "$DEST/libproot.so" || true
-            patchelf --set-rpath '$ORIGIN' "$DEST/libproot.so"
-            LOADER_SRC=$(find extract -path "*/libexec/proot/loader" | head -n 1)
-            cp "$LOADER_SRC" "$DEST/libproot-loader.so"
-            chmod 755 "$DEST/"*.so*
-            cd "$GITHUB_WORKSPACE"
-          fi
-
-          mkdir -p app/src/main/assets
-          python3 - << 'EOF'
-          import urllib.request, json, subprocess, os, sys
-          urls = []
-          try:
-              res = subprocess.run(["gh", "api", "repos/termux/proot-distro/releases?per_page=100"], capture_output=True, text=True)
-              for rel in json.loads(res.stdout):
-                  for asset in rel.get("assets", []):
-                      n = asset.get("name", "")
-                      if "debian" in n and "aarch64" in n and ("tar.xz" in n or "tar.gz" in n):
-                          urls.append(asset.get("browser_download_url"))
-          except Exception:
-              pass
-          urls.append("https://raw.githubusercontent.com/debuerreotype/docker-debian-artifacts/dist-arm64v8/bookworm/rootfs.tar.xz")
-          urls.append("http://cdimage.ubuntu.com/ubuntu-base/releases/22.04/release/ubuntu-base-22.04-base-arm64.tar.gz")
-          ok = False
-          for u in urls:
-              try:
-                  req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"})
-                  with urllib.request.urlopen(req, timeout=60) as r:
-                      ext = ".xz" if "xz" in u else ".gz"
-                      dest = f"app/src/main/assets/debian-rootfs.tar{ext}"
-                      with open(dest, "wb") as f:
-                          while True:
-                              c = r.read(1024 * 1024)
-                              if not c: break
-                              f.write(c)
-                      if os.path.getsize(dest) > 10 * 1024 * 1024:
-                          ok = True
-                          break
-              except Exception:
-                  pass
-          if not ok:
-              sys.exit(1)
-          EOF
-          curl -fSL -H "User-Agent: Mozilla/5.0" "https://update.code.visualstudio.com/latest/linux-arm64/stable" -o app/src/main/assets/vscode-linux-arm64.tar.gz
-
-      - name: Setup Permanent Keystore from Repo (app/keystore.jks)
-        run: |
-          mkdir -p ~/.android
+          # 1) keystore committed in the repo (app/keystore.jks)
           if [ -f "app/keystore.jks" ]; then
-            cp -f app/keystore.jks ~/.android/debug.keystore
-          else
+            echo "Using permanent keystore from the repository (app/keystore.jks)."
+            RESTORED=true
+          fi
+
+          # 2) keystore saved with an earlier GitHub Release
+          if [ "$RESTORED" = "false" ]; then
+            if gh release download --pattern "pocket-vscode-permanent.keystore" --dir /tmp/keystore_dl --clobber 2>/dev/null; then
+              if [ -s "/tmp/keystore_dl/pocket-vscode-permanent.keystore" ]; then
+                echo "Restored permanent keystore from the latest GitHub Release."
+                cp /tmp/keystore_dl/pocket-vscode-permanent.keystore app/keystore.jks
+                RESTORED=true
+              fi
+            fi
+          fi
+
+          # 3) first ever build: generate it once; it is saved below and reused forever
+          if [ "$RESTORED" = "false" ]; then
+            echo "No keystore found anywhere - generating the permanent keystore (first build only)."
             keytool -genkeypair -v \
-              -keystore ~/.android/debug.keystore \
+              -keystore app/keystore.jks \
               -alias androiddebugkey \
               -keyalg RSA \
               -keysize 2048 \
@@ -246,44 +147,511 @@ jobs:
               -storepass android \
               -keypass android \
               -dname "CN=PocketVSCode, OU=Dev, O=Standalone, L=Bijnor, ST=UP, C=IN"
-            mkdir -p app
-            cp -f ~/.android/debug.keystore app/keystore.jks
           fi
+
+          # A keystore that cannot be opened must STOP the build: silently signing with another key would break updates.
+          if ! keytool -list -keystore app/keystore.jks -storepass android -alias androiddebugkey >/dev/null 2>&1; then
+            echo "::error::app/keystore.jks cannot be opened with alias 'androiddebugkey' / password 'android'."
+            exit 1
+          fi
+
+          cp app/keystore.jks ~/.android/debug.keystore
+          cp app/keystore.jks pocket-vscode-permanent.keystore
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f app/keystore.jks || true
+          git commit -m "chore: save permanent keystore" || true
+          git push origin HEAD:${{ github.ref_name }} || true
+
+      - name: Pre-Bundle Debian Rootfs and Official VS Code
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p app/src/main/assets
+          rm -f app/src/main/assets/debian-rootfs.tar.* app/src/main/assets/vscode-linux-arm64.tar.*
+
+          # Candidate rootfs URLs, best first. Pinned to Debian bookworm: init-rootfs.sh package names match it.
+          python3 - << 'EOF' > /tmp/rootfs_urls.txt
+          import json, subprocess, sys
+          urls = []
+          try:
+              res = subprocess.run(
+                  ["gh", "api", "repos/termux/proot-distro/releases?per_page=100"],
+                  capture_output=True, text=True, timeout=120)
+              for rel in json.loads(res.stdout):
+                  for asset in rel.get("assets", []):
+                      n = asset.get("name", "")
+                      if n.startswith("debian-bookworm") and "aarch64" in n and (n.endswith(".tar.xz") or n.endswith(".tar.gz")):
+                          urls.append(asset["browser_download_url"])
+          except Exception as e:
+              print("proot-distro release lookup failed:", e, file=sys.stderr)
+          urls.append("https://raw.githubusercontent.com/debuerreotype/docker-debian-artifacts/dist-arm64v8/bookworm/rootfs.tar.xz")
+          urls.append("http://cdimage.ubuntu.com/ubuntu-base/releases/22.04/release/ubuntu-base-22.04-base-arm64.tar.gz")
+          print("\n".join(urls))
+          EOF
+
+          OK=false
+          while read -r URL; do
+            [ -z "$URL" ] && continue
+            case "$URL" in
+              *.xz) EXT=xz ;;
+              *)    EXT=gz ;;
+            esac
+            DEST="app/src/main/assets/debian-rootfs.tar.$EXT"
+            rm -f app/src/main/assets/debian-rootfs.tar.*
+            echo "Trying rootfs: $URL"
+            if curl -fL --retry 4 --retry-delay 5 --connect-timeout 30 -A "Mozilla/5.0" -o "$DEST" "$URL"; then
+              SIZE=$(stat -c %s "$DEST")
+              if [ "$SIZE" -gt 10485760 ]; then
+                if { [ "$EXT" = "xz" ] && xz -t "$DEST"; } || { [ "$EXT" = "gz" ] && gzip -t "$DEST"; }; then
+                  OK=true
+                  break
+                fi
+              fi
+            fi
+          done < /tmp/rootfs_urls.txt
+
+          if [ "$OK" != "true" ]; then
+            echo "::error::Could not download a valid Debian ARM64 rootfs from any source."
+            exit 1
+          fi
+          ls -lh app/src/main/assets/
+
+          curl -fSL --retry 4 --retry-delay 5 --connect-timeout 30 -H "User-Agent: Mozilla/5.0" \
+            "https://update.code.visualstudio.com/latest/linux-arm64/stable" \
+            -o app/src/main/assets/vscode-linux-arm64.tar.gz
+          gzip -t app/src/main/assets/vscode-linux-arm64.tar.gz
+          if [ "$(stat -c %s app/src/main/assets/vscode-linux-arm64.tar.gz)" -lt 52428800 ]; then
+            echo "::error::VS Code archive is suspiciously small."
+            exit 1
+          fi
+          ls -lh app/src/main/assets/
+
+      - name: Pre-bake the Linux environment into the rootfs (phone will not run apt)
+        env:
+          # 1 = compiler + gdb + git + python3 + nodejs/npm (default), 0 = git only (smaller, faster first start)
+          POCKET_DEV_TOOLS: "1"
+        run: |
+          set -euo pipefail
+
+          # arm64 emulation on the x86 runner (qemu-user via binfmt_misc, registered with the "fix binary" flag).
+          sudo apt-get update -qq
+          sudo apt-get install -y qemu-user-static binfmt-support pigz
+          # newer qemu than the distro package (re-registers the arm64 handler); harmless if docker is unavailable
+          docker run --privileged --rm tonistiigi/binfmt --install arm64 >/dev/null 2>&1 || true
+
+          BASE=$(ls app/src/main/assets/debian-rootfs.tar.* | head -n 1)
+          echo "Base rootfs: $BASE"
+          WORK=/tmp/bake
+          sudo rm -rf "$WORK"; mkdir -p "$WORK/extract"
+          sudo tar -xpf "$BASE" -C "$WORK/extract" --numeric-owner
+
+          # Some rootfs archives wrap everything in one directory (e.g. debian-bookworm-aarch64/).
+          R="$WORK/extract"
+          if [ ! -d "$R/etc" ]; then
+            INNER=$(find "$R" -mindepth 1 -maxdepth 1 -type d | head -n 1)
+            if [ -n "$INNER" ] && [ -d "$INNER/etc" ]; then R="$INNER"; fi
+          fi
+          [ -d "$R/etc" ] && [ -d "$R/usr" ] || { echo "::error::Unexpected rootfs layout"; sudo ls -la "$WORK/extract"; exit 1; }
+          echo "Rootfs directory: $R"
+
+          # Is arm64 emulation working?  (fallback: copy the apt qemu binary into the chroot)
+          if ! sudo chroot "$R" /bin/sh -c 'uname -m' 2>/dev/null | grep -q aarch64; then
+            echo "binfmt not active for the chroot - copying qemu-aarch64-static into the rootfs"
+            sudo cp /usr/bin/qemu-aarch64-static "$R/usr/bin/"
+            sudo update-binfmts --enable qemu-aarch64 || true
+          fi
+          sudo chroot "$R" /bin/sh -c 'uname -m' | grep -q aarch64 || { echo "::error::arm64 emulation is not working on this runner"; exit 1; }
+
+          cleanup_mounts() {
+            sudo umount -l "$R/proc" 2>/dev/null || true
+            sudo umount -l "$R/dev" 2>/dev/null || true
+          }
+          trap cleanup_mounts EXIT
+
+          sudo mkdir -p "$R/proc" "$R/dev" "$R/tmp" "$R/root"
+          sudo mount --bind /dev "$R/dev"
+          sudo mount -t proc proc "$R/proc"
+
+          # DNS for apt inside the chroot (the app rewrites resolv.conf at runtime anyway)
+          sudo rm -f "$R/etc/resolv.conf"
+          if [ -s /run/systemd/resolve/resolv.conf ]; then
+            sudo cp /run/systemd/resolve/resolv.conf "$R/etc/resolv.conf"
+          else
+            printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' | sudo tee "$R/etc/resolv.conf" >/dev/null
+          fi
+
+          # Never try to start services while packages are configured in a chroot.
+          printf '#!/bin/sh\nexit 101\n' | sudo tee "$R/usr/sbin/policy-rc.d" >/dev/null
+          sudo chmod 755 "$R/usr/sbin/policy-rc.d"
+
+          sudo cp app/src/main/assets/init-rootfs.sh "$R/tmp/init-rootfs.sh"
+          sudo chmod 755 "$R/tmp/init-rootfs.sh"
+
+          echo "=== running init-rootfs.sh inside the arm64 rootfs (POCKET_DEV_TOOLS=$POCKET_DEV_TOOLS) ==="
+          sudo chroot "$R" /usr/bin/env -i HOME=/root TERM=xterm \
+            PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            POCKET_DEV_TOOLS="$POCKET_DEV_TOOLS" \
+            /bin/bash /tmp/init-rootfs.sh
+
+          # ---- sanity: everything the app needs must be in the rootfs ----
+          missing=0
+          for f in root/.pocket-setup-done usr/bin/Xtigervnc usr/bin/openbox usr/bin/websockify usr/share/novnc usr/bin/git usr/local/bin/code root/.vscode/argv.json root/.config/Code/User/settings.json; do
+            if ! sudo test -e "$R/$f" && ! sudo test -L "$R/$f"; then echo "::error::missing in baked rootfs: /$f"; missing=1; fi
+          done
+          [ "$missing" = "0" ] || exit 1
+
+          # ---- shrink: only what is not needed at runtime ----
+          sudo rm -f "$R/usr/sbin/policy-rc.d" "$R/usr/bin/qemu-aarch64-static" "$R/tmp/init-rootfs.sh"
+          sudo chroot "$R" /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin /usr/bin/apt-get clean || true
+          sudo rm -rf "$R"/var/lib/apt/lists/* "$R"/var/cache/apt/* "$R"/var/log/* "$R"/tmp/* "$R"/root/.cache
+          sudo find "$R/usr/share/doc" -type f ! -name copyright -delete 2>/dev/null || true
+          sudo find "$R/usr/share/doc" -type d -empty -delete 2>/dev/null || true
+          sudo rm -rf "$R"/usr/share/man/* "$R"/usr/share/info/* "$R"/usr/share/lintian/* "$R"/usr/share/bug/*
+          sudo find "$R/usr/share/locale" -mindepth 1 -maxdepth 1 -type d ! -name 'en*' -exec rm -rf {} + 2>/dev/null || true
+          printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' | sudo tee "$R/etc/resolv.conf" >/dev/null
+
+          # Big hard-linked files (git, perl, ...) would be COPIED once per link on the phone: turn the extra links
+          # into relative symlinks so they cost no space and no extraction time.
+          cat > /tmp/dedupe_hardlinks.py << 'PYEOF'
+          import os, sys
+          root = sys.argv[1]
+          groups = {}
+          for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+              for fn in filenames:
+                  p = os.path.join(dirpath, fn)
+                  try:
+                      st = os.lstat(p)
+                  except OSError:
+                      continue
+                  if os.path.islink(p) or not os.path.isfile(p) or st.st_nlink < 2 or st.st_size < 131072:
+                      continue
+                  groups.setdefault((st.st_dev, st.st_ino), []).append((p, st.st_size))
+
+          def rank(item):
+              # keep the real file in a normal executable directory, with the shortest name (e.g. /usr/bin/git)
+              p = item[0]
+              rel = os.path.relpath(p, root)
+              in_bin = rel.startswith(("usr/bin/", "usr/sbin/", "bin/", "sbin/", "usr/local/bin/"))
+              return (0 if in_bin else 1, len(rel), rel)
+
+          saved = 0
+          for paths in groups.values():
+              paths.sort(key=rank)
+              keep = paths[0][0]
+              for p, size in paths[1:]:
+                  rel = os.path.relpath(keep, os.path.dirname(p))
+                  os.unlink(p)
+                  os.symlink(rel, p)
+                  saved += size
+          print("hard links turned into symlinks, bytes not duplicated on the phone:", saved)
+          PYEOF
+          sudo python3 -I /tmp/dedupe_hardlinks.py "$R"
+
+          cleanup_mounts
+          for m in proc dev; do
+            if mountpoint -q "$R/$m"; then echo "::error::$m is still mounted - refusing to archive"; exit 1; fi
+          done
+          sudo find "$R/dev" "$R/proc" -mindepth 1 -delete 2>/dev/null || true
+
+          echo "Unpacked size:"; sudo du -sh "$R"
+          echo "--- biggest directories (to see what makes the image large) ---"
+          sudo du -xh --max-depth=2 "$R/usr" "$R/var" "$R/opt" "$R/root" "$R/etc" 2>/dev/null | sort -h | tail -n 25 || true
+          rm -f app/src/main/assets/debian-rootfs.tar.*
+
+          # gzip first (unpacks 2-3x faster than xz on the phone). A GitHub Release file must stay below 2 GiB, so if
+          # rootfs + VS Code archive together are too big for that, the rootfs is packed with xz instead (smaller, but
+          # slower to unpack). Sorted so /bin comes first.
+          ASSETS=app/src/main/assets
+          MAX_ASSET_BYTES=1700000000
+          VSC_SIZE=$(stat -c %s "$ASSETS/vscode-linux-arm64.tar.gz")
+          sudo tar --numeric-owner --sort=name -C "$R" -cf - . | pigz -9 -p "$(nproc)" > "$ASSETS/debian-rootfs.tar.gz"
+          gzip -t "$ASSETS/debian-rootfs.tar.gz"
+          GZ_SIZE=$(stat -c %s "$ASSETS/debian-rootfs.tar.gz")
+          echo "gzip image: $GZ_SIZE bytes, VS Code archive: $VSC_SIZE bytes"
+          if [ $((GZ_SIZE + VSC_SIZE)) -gt "$MAX_ASSET_BYTES" ]; then
+            echo "::warning::rootfs + VS Code archives exceed $MAX_ASSET_BYTES bytes - packing the rootfs with xz so the APK stays below 2 GiB."
+            rm -f "$ASSETS/debian-rootfs.tar.gz"
+            sudo tar --numeric-owner --sort=name -C "$R" -cf - . | xz -7 -T0 > "$ASSETS/debian-rootfs.tar.xz"
+            xz -t "$ASSETS/debian-rootfs.tar.xz"
+            XZ_SIZE=$(stat -c %s "$ASSETS/debian-rootfs.tar.xz")
+            echo "xz image: $XZ_SIZE bytes"
+            if [ $(( XZ_SIZE + VSC_SIZE )) -gt 1900000000 ]; then
+              echo "::error::Even with xz the APK would be about $(( XZ_SIZE + VSC_SIZE )) bytes (> 2 GiB). Set POCKET_DEV_TOOLS to \"0\" in this step."
+              exit 1
+            fi
+          fi
+          echo "baked" > "$ASSETS/rootfs-baked.flag"
+          ls -lh app/src/main/assets/
+          sudo rm -rf "$WORK"
+
+      - name: Generate VS Code Icons (adaptive + legacy, all densities)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y python3-pil curl
+
+          # Remove any default Android robot launcher resources
+          rm -rf app/src/main/res/mipmap-anydpi*
+          rm -rf app/src/main/res/mipmap-*/ic_launcher*
+          rm -rf app/src/main/res/drawable*/ic_launcher*
+
+          # Icon source priority: 1) icon.png in the repo root (your own image)
+          #                       2) the BRANDED Microsoft VS Code icon inside the official tarball downloaded above
+          #                       3) generated "</>" mark (never fails the build)
+          # NOTE: microsoft/vscode/resources/linux/code.png on GitHub is the open-source "Code - OSS" artwork, NOT the
+          # official logo, so it is deliberately not used.
+          rm -f vscode_icon.png
+          if [ -f icon.png ]; then
+            echo "Using icon.png from the repository root."
+            cp icon.png vscode_icon.png
+          else
+            VSC_TAR=app/src/main/assets/vscode-linux-arm64.tar.gz
+            tar -tzf "$VSC_TAR" > /tmp/vscode_tar_list.txt || true
+            ICON_PATH=$(grep -m1 -E 'resources/app/resources/linux/code\.png$' /tmp/vscode_tar_list.txt || true)
+            if [ -n "$ICON_PATH" ]; then
+              echo "Using the official icon from the VS Code archive: $ICON_PATH"
+              tar -xzf "$VSC_TAR" -O "$ICON_PATH" > vscode_icon.png
+            else
+              echo "::warning::Official icon not found in the VS Code archive - a generated fallback icon will be used."
+            fi
+          fi
+
+          python3 - << 'EOF'
+          import os
+          from PIL import Image, ImageDraw
+
+          RES = "app/src/main/res"
+          BG = (30, 30, 30, 255)  # #1E1E1E
+
+          def load_source():
+              path = "vscode_icon.png"
+              if os.path.isfile(path) and os.path.getsize(path) > 1024:
+                  try:
+                      Image.open(path).verify()
+                      return Image.open(path).convert("RGBA")
+                  except Exception as e:
+                      print("Icon file unusable:", e)
+              # Fallback so the build never fails because of the icon: simple blue "</>" mark (original artwork)
+              img = Image.new("RGBA", (512, 512), (0, 0, 0, 0))
+              d = ImageDraw.Draw(img)
+              d.rounded_rectangle((32, 32, 480, 480), radius=96, fill=(0, 122, 204, 255))
+              w = 36
+              d.line([(212, 160), (116, 256), (212, 352)], fill="white", width=w, joint="curve")
+              d.line([(300, 160), (396, 256), (300, 352)], fill="white", width=w, joint="curve")
+              d.line([(276, 150), (236, 362)], fill="white", width=26)
+              return img
+
+          def tight_square(img):
+              box = img.getbbox()
+              if box:
+                  img = img.crop(box)
+              side = max(img.size)
+              sq = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+              sq.paste(img, ((side - img.width) // 2, (side - img.height) // 2), img)
+              return sq
+
+          src = tight_square(load_source())
+
+          # ---- adaptive icon definition (API 26+): #1E1E1E background + centred foreground ----
+          v26 = os.path.join(RES, "mipmap-anydpi-v26")
+          os.makedirs(v26, exist_ok=True)
+          adaptive_xml = """<?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_launcher_background" />
+              <foreground android:drawable="@mipmap/ic_launcher_foreground" />
+          </adaptive-icon>
+          """
+          for name in ("ic_launcher.xml", "ic_launcher_round.xml"):
+              with open(os.path.join(v26, name), "w") as f:
+                  f.write(adaptive_xml)
+
+          # (legacy launcher size, adaptive 108dp canvas size) per density
+          densities = {
+              "mipmap-mdpi": (48, 108),
+              "mipmap-hdpi": (72, 162),
+              "mipmap-xhdpi": (96, 216),
+              "mipmap-xxhdpi": (144, 324),
+              "mipmap-xxxhdpi": (192, 432),
+          }
+
+          for folder, (legacy, adaptive) in densities.items():
+              out = os.path.join(RES, folder)
+              os.makedirs(out, exist_ok=True)
+
+              # adaptive foreground: logo inside the 66dp safe zone of the 108dp canvas
+              fg = Image.new("RGBA", (adaptive, adaptive), (0, 0, 0, 0))
+              inner = int(adaptive * 0.58)
+              logo = src.resize((inner, inner), Image.Resampling.LANCZOS)
+              fg.paste(logo, ((adaptive - inner) // 2, (adaptive - inner) // 2), logo)
+              fg.save(os.path.join(out, "ic_launcher_foreground.png"))
+
+              # legacy square + round icons (used only by launchers that ignore adaptive icons)
+              big = legacy * 4
+              plate = Image.new("RGBA", (big, big), (0, 0, 0, 0))
+              ImageDraw.Draw(plate).rounded_rectangle((0, 0, big - 1, big - 1), radius=int(big * 0.22), fill=BG)
+              inner_l = int(big * 0.68)
+              logo_l = src.resize((inner_l, inner_l), Image.Resampling.LANCZOS)
+              plate.paste(logo_l, ((big - inner_l) // 2, (big - inner_l) // 2), logo_l)
+              plate.resize((legacy, legacy), Image.Resampling.LANCZOS).save(os.path.join(out, "ic_launcher.png"))
+
+              disc = Image.new("RGBA", (big, big), (0, 0, 0, 0))
+              ImageDraw.Draw(disc).ellipse((0, 0, big - 1, big - 1), fill=BG)
+              inner_r = int(big * 0.60)
+              logo_r = src.resize((inner_r, inner_r), Image.Resampling.LANCZOS)
+              disc.paste(logo_r, ((big - inner_r) // 2, (big - inner_r) // 2), logo_r)
+              disc.resize((legacy, legacy), Image.Resampling.LANCZOS).save(os.path.join(out, "ic_launcher_round.png"))
+
+          print("Icons generated for", ", ".join(densities))
+          EOF
+
+          grep -q '@mipmap/ic_launcher"' app/src/main/AndroidManifest.xml || { echo "::error::Manifest does not reference @mipmap/ic_launcher"; exit 1; }
+          ls app/src/main/res/mipmap-xxxhdpi app/src/main/res/mipmap-anydpi-v26
+
+      - name: Fetch and Patch ARM64 Binaries
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y patchelf
+          mkdir -p /tmp/debs
+          cd /tmp/debs
+          PACKAGES_URL="https://packages.termux.dev/apt/termux-main/dists/stable/main/binary-aarch64/Packages"
+          curl -fsSL --retry 3 "$PACKAGES_URL" -o Packages
+          PROOT_DEB_PATH=$(awk '/^Package: proot$/,/^$/' Packages | grep '^Filename:' | head -n 1 | awk '{print $2}')
+          TALLOC_DEB_PATH=$(awk '/^Package: libtalloc$/,/^$/' Packages | grep '^Filename:' | head -n 1 | awk '{print $2}')
+          SHMEM_DEB_PATH=$(awk '/^Package: libandroid-shmem$/,/^$/' Packages | grep '^Filename:' | head -n 1 | awk '{print $2}')
+          if [ -z "$SHMEM_DEB_PATH" ]; then
+            SHMEM_DEB_PATH=$(grep -E 'libandroid-shmem.*_aarch64\.deb' Packages | head -n 1 | awk '{print $2}')
+          fi
+          for v in PROOT_DEB_PATH TALLOC_DEB_PATH SHMEM_DEB_PATH; do
+            if [ -z "${!v}" ]; then echo "::error::$v not found in the Termux package index"; exit 1; fi
+          done
+          curl -fsSL --retry 3 "https://packages.termux.dev/apt/termux-main/$PROOT_DEB_PATH" -o proot.deb
+          curl -fsSL --retry 3 "https://packages.termux.dev/apt/termux-main/$TALLOC_DEB_PATH" -o talloc.deb
+          curl -fsSL --retry 3 "https://packages.termux.dev/apt/termux-main/$SHMEM_DEB_PATH" -o shmem.deb
+          mkdir -p extract
+          for f in proot.deb talloc.deb shmem.deb; do
+            mkdir -p "extract/$f"
+            cd "extract/$f"
+            ar x "/tmp/debs/$f"
+            tar -xf data.tar.*
+            cd /tmp/debs
+          done
+          DEST="$GITHUB_WORKSPACE/app/src/main/jniLibs/arm64-v8a"
+          mkdir -p "$DEST"
+          TALLOC_SRC=$(find extract -name "libtalloc.so*" | head -n 1)
+          cp "$TALLOC_SRC" "$DEST/libtalloc.so"
+          patchelf --set-soname libtalloc.so "$DEST/libtalloc.so"
+          patchelf --set-rpath '$ORIGIN' "$DEST/libtalloc.so" || true
+          SHMEM_SRC=$(find extract -name "libandroid-shmem.so*" | head -n 1)
+          cp "$SHMEM_SRC" "$DEST/libandroid-shmem.so"
+          patchelf --set-soname libandroid-shmem.so "$DEST/libandroid-shmem.so"
+          patchelf --set-rpath '$ORIGIN' "$DEST/libandroid-shmem.so" || true
+          PROOT_SRC=$(find extract -path "*/usr/bin/proot" | head -n 1)
+          cp "$PROOT_SRC" "$DEST/libproot.so"
+          patchelf --replace-needed libtalloc.so.2 libtalloc.so "$DEST/libproot.so" || true
+          patchelf --set-rpath '$ORIGIN' "$DEST/libproot.so"
+          LOADER_SRC=$(find extract -path "*/libexec/proot/loader" | head -n 1)
+          cp "$LOADER_SRC" "$DEST/libproot-loader.so"
+          chmod 755 "$DEST/"*.so*
+          for lib in libproot.so libproot-loader.so libtalloc.so libandroid-shmem.so; do
+            if [ ! -s "$DEST/$lib" ]; then echo "::error::$lib is missing from jniLibs"; exit 1; fi
+          done
+          ls -l "$DEST"
+
+      - name: Give the big archives a neutral file extension (the Android build unpacks *.gz assets)
+        run: |
+          cd app/src/main/assets
+          for f in debian-rootfs.tar.gz vscode-linux-arm64.tar.gz; do
+            if [ -f "$f" ]; then mv "$f" "$f.pkg"; fi
+          done
+          ls -l
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
 
-      - name: Assemble, Zipalign & Sign APK (v1 + v2 + v3)
+      - name: Assemble Standalone APK with the Permanent Signature
         run: |
           gradle wrapper --gradle-version 8.7
-          ./gradlew assembleDebug --no-daemon
+          ./gradlew assembleDebug --stacktrace
+          cp app/build/outputs/apk/debug/app-debug.apk PocketVSCode-arm64.apk
+          ls -lh PocketVSCode-arm64.apk
 
-          RAW_APK=$(find app/build/outputs/apk/debug -name "*.apk" | head -n 1)
-          BUILD_TOOLS_DIR=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -n 1)
+      - name: APK content report (largest entries)
+        if: always()
+        run: |
+          [ -f PocketVSCode-arm64.apk ] || exit 0
+          ls -l PocketVSCode-arm64.apk
+          echo "entries in the APK: $(unzip -Z1 PocketVSCode-arm64.apk | wc -l)"
+          echo "--- 15 largest entries (uncompressed bytes, compressed bytes, method, name) ---"
+          unzip -Zl PocketVSCode-arm64.apk | awk 'NF>=10 {print $4, $6, $7, $NF}' | sort -rn | head -n 15
+          echo "--- entries whose name occurs more than once ---"
+          unzip -Z1 PocketVSCode-arm64.apk | sort | uniq -d | head -n 20
+          # Every big asset must be stored in the APK exactly as it was put into app/src/main/assets.
+          python3 -I - << 'PYEOF'
+          import os, sys, zipfile
+          z = zipfile.ZipFile("PocketVSCode-arm64.apk")
+          sizes = {i.filename: i.file_size for i in z.infolist()}
+          bad = False
+          for name in sorted(os.listdir("app/src/main/assets")):
+              path = os.path.join("app/src/main/assets", name)
+              if os.path.getsize(path) < 50_000_000:
+                  continue
+              got = sizes.get("assets/" + name)
+              print("asset", name, "on disk:", os.path.getsize(path), "in APK:", got)
+              if got != os.path.getsize(path):
+                  print("::error::assets/%s is not stored unchanged in the APK" % name)
+                  bad = True
+          sys.exit(1 if bad else 0)
+          PYEOF
 
-          "$BUILD_TOOLS_DIR/zipalign" -p -f -v 4 "$RAW_APK" aligned.apk
-          "$BUILD_TOOLS_DIR/apksigner" sign \
-            --ks ~/.android/debug.keystore \
-            --ks-key-alias androiddebugkey \
-            --ks-pass pass:android \
-            --key-pass pass:android \
-            --v1-signing-enabled true \
-            --v2-signing-enabled true \
-            --v3-signing-enabled true \
-            --out PocketVSCode-arm64.apk \
-            aligned.apk
+      - name: Verify APK (package, version, signature)
+        run: |
+          BT=$(ls -d "${ANDROID_HOME:-$ANDROID_SDK_ROOT}"/build-tools/* 2>/dev/null | sort -V | tail -n 1)
+          if [ -z "$BT" ]; then
+            echo "Android build-tools not found on the runner - skipping APK verification."
+            exit 0
+          fi
 
-          "$BUILD_TOOLS_DIR/apksigner" verify --verbose PocketVSCode-arm64.apk
+          BADGING=$("$BT/aapt2" dump badging PocketVSCode-arm64.apk 2>/dev/null | grep -m1 '^package:' || true)
+          echo "$BADGING"
+          if [ -n "$BADGING" ]; then
+            echo "$BADGING" | grep -q "name='com.anshrajput.pocketvscode'" || { echo "::error::APK package id is not com.anshrajput.pocketvscode"; exit 1; }
+            echo "$BADGING" | grep -q "versionCode='$VERSION_CODE'" || { echo "::error::APK versionCode is not $VERSION_CODE"; exit 1; }
+          fi
 
-      - name: Publish Direct APK to GitHub Releases
+          APK_SHA=$("$BT/apksigner" verify --print-certs PocketVSCode-arm64.apk 2>/dev/null | grep -m1 'certificate SHA-256 digest' | awk '{print $NF}' | tr 'A-F' 'a-f' || true)
+          KS_SHA=$(keytool -list -v -keystore app/keystore.jks -storepass android -alias androiddebugkey 2>/dev/null | grep -m1 'SHA256:' | awk '{print $2}' | tr -d ':' | tr 'A-F' 'a-f' || true)
+          echo "APK signer SHA-256      : $APK_SHA"
+          echo "Permanent keystore SHA-256: $KS_SHA"
+          if [ -n "$APK_SHA" ] && [ -n "$KS_SHA" ] && [ "$APK_SHA" != "$KS_SHA" ]; then
+            echo "::error::APK is NOT signed with the permanent keystore - updates would fail with 'App not installed'."
+            exit 1
+          fi
+
+      - name: Publish Direct APK & Keystore to GitHub Releases
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           RELEASE_TAG="v1.0.${{ github.run_number }}"
-          gh release create "$RELEASE_TAG" PocketVSCode-arm64.apk \
-            --target "${{ github.sha }}" \
-            --title "Pocket VS Code ($RELEASE_TAG)" \
-            --notes "Fixed APK installation (useLegacyPackaging + extractNativeLibs + zipalign + v1/v2/v3 signing) with zero changes to app code."
+          NOTES="Pocket VS Code ${RELEASE_TAG} (versionCode ${VERSION_CODE}). Package com.anshrajput.pocketvscode, signed with the permanent keystore: installs as an in-place update. Mode 2 auto-opens, 0.5 s auto-save, 10-minute idle hibernation."
+          # The keystore always goes first (it is tiny and is the key to future updates).
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" pocket-vscode-permanent.keystore --clobber
+          else
+            gh release create "$RELEASE_TAG" pocket-vscode-permanent.keystore \
+              --target "${{ github.sha }}" \
+              --title "Pocket VS Code ($RELEASE_TAG)" \
+              --notes "$NOTES"
+          fi
+
+          # GitHub rejects release files of 2 GiB or more.
+          APK_SIZE=$(stat -c %s PocketVSCode-arm64.apk)
+          echo "APK size: $APK_SIZE bytes"
+          if [ "$APK_SIZE" -ge 2147483647 ]; then
+            echo "::error::The APK is $APK_SIZE bytes - GitHub Releases only accept files below 2 GiB. Set POCKET_DEV_TOOLS to \"0\" in the Pre-bake step. The APK is still available as the workflow artifact."
+            exit 1
+          fi
+          gh release upload "$RELEASE_TAG" PocketVSCode-arm64.apk --clobber
 
       - name: Upload Artifact Backup
         if: always()
@@ -291,3 +659,4 @@ jobs:
         with:
           name: Pocket-VS-Code-arm64-v8a-APK
           path: PocketVSCode-arm64.apk
+          if-no-files-found: ignore
