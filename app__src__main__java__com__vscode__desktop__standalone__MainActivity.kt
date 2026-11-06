@@ -334,6 +334,9 @@ class MainActivity : AppCompatActivity(), ProvisionListener {
 
     /** Mode 2: WorkbenchActivity starts/attaches to `code serve-web` and opens it as soon as port 8080 is live. */
     private fun launchMode2() {
+        // one mode at a time: the two modes share settings and extensions
+        if (Mode1Session.isAlive) AppLog.add("Stopping Mode 1 (Mode 2 shares its settings and extensions).")
+        Mode1Session.stop()
         LinuxRuntimeService.start(this, LinuxRuntimeService.MODE_DIRECT)
         startActivity(Intent(this, WorkbenchActivity::class.java))
     }
@@ -344,6 +347,10 @@ class MainActivity : AppCompatActivity(), ProvisionListener {
         launchButton.isEnabled = false
         launchButton.alpha = 0.5f
         statusText.text = "Starting Mode 1 (Xtigervnc + Openbox + VS Code)…"
+        // one mode at a time: the two modes share settings and extensions
+        Mode1Session.starting = true
+        if (Mode2Server.isProcessAlive) AppLog.add("Stopping Mode 2 (Mode 1 shares its settings and extensions).")
+        Mode2Server.stop()
         LinuxRuntimeService.start(this, LinuxRuntimeService.MODE_X11)
 
         val (screenW, screenH) = mode1ScreenSize()
@@ -353,6 +360,7 @@ class MainActivity : AppCompatActivity(), ProvisionListener {
             var errorMessage: String? = null
             try {
                 Mode1Session.stop()
+                prootManager.ensureSharedState()
                 prootManager.writeMode1Geometry(screenW, screenH)
                 val p = prootManager.startProotCommand(
                     command = "bash /root/start-vscode-session.sh x11",
@@ -365,8 +373,10 @@ class MainActivity : AppCompatActivity(), ProvisionListener {
                 )
                 started = p
                 Mode1Session.process = p
+                Mode1Session.starting = false
                 p.waitFor()
             } catch (e: Exception) {
+                Mode1Session.starting = false
                 errorMessage = "Could not start Mode 1: ${e.message}"
                 AppLog.add("Mode 1 failed: ${e.message}")
             }

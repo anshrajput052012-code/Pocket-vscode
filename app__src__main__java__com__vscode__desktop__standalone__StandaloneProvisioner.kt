@@ -31,9 +31,12 @@ interface ProvisionListener {
 
 /**
  * Unpacks the Debian ARM64 rootfs and the official Microsoft VS Code (linux-arm64) that the CI pre-bundled into
- * the APK assets, then runs init-rootfs.sh inside PRoot.
+ * the APK assets.
  *
- * Overall progress: rootfs extraction 0-15 %, VS Code extraction 15-30 %, environment setup 30-100 %.
+ * The CI normally bakes the whole environment (X11, VNC, git, compilers, ...) into the rootfs (asset marker
+ * "rootfs-baked.flag"), so the phone only unpacks: rootfs 0-70 %, VS Code 70-95 %, finishing 95-100 %.
+ * For a rootfs that is NOT baked, init-rootfs.sh still runs inside PRoot as before (apt, needs internet):
+ * rootfs 0-15 %, VS Code 15-30 %, environment setup 30-100 %.
  * Every phase is resumable: a phase is skipped only when its completion marker exists, and an interrupted
  * extraction is wiped and redone.
  */
@@ -92,6 +95,10 @@ class StandaloneProvisioner(
     fun provisionAll(onProgress: (ProvisionProgress) -> Unit, onLog: (String) -> Unit): Boolean {
         failure = null
         val reporter = Reporter(onProgress)
+        val baked = findAsset(BAKED_FLAG) != null
+        val wRootfs = if (baked) W_ROOTFS_BAKED else W_ROOTFS
+        val wVscode = if (baked) W_VSCODE_BAKED else W_VSCODE
+        val wEnv = 100 - wRootfs - wVscode
         return try {
             prootManager.isRootfsProvisioned() // adopts installs made by older builds
 
@@ -103,16 +110,16 @@ class StandaloneProvisioner(
                 val asset = findAsset("debian-rootfs.tar")
                     ?: throw IOException("Pre-bundled debian-rootfs asset not found in the APK")
                 onLog("[1/3] Extracting Debian rootfs from APK ($asset)")
-                extractAsset(asset, prootManager.rootfsDir, StripMode.AUTO_ROOTFS, 0, W_ROOTFS, STEP_1, reporter)
+                extractAsset(asset, prootManager.rootfsDir, StripMode.AUTO_ROOTFS, 0, wRootfs, STEP_1, reporter)
                 prootManager.rootfsMarker.writeText("ok\n")
             } else {
-                reporter.update(W_ROOTFS, STEP_1, "Already installed", force = true)
+                reporter.update(wRootfs, STEP_1, "Already installed", force = true)
                 onLog("[1/3] Debian rootfs already installed.")
             }
 
             // ---- 2/3 Official VS Code -----------------------------------------------------------
             if (!prootManager.vscodeMarker.exists()) {
-                reporter.update(W_ROOTFS, STEP_2, "Preparing…", force = true)
+                reporter.update(wRootfs, STEP_2, "Preparing…", force = true)
                 wipeDirectory(prootManager.vscodeDir)
                 prootManager.vscodeDir.mkdirs()
                 val asset = findAsset("vscode-linux-arm64")
@@ -120,23 +127,23 @@ class StandaloneProvisioner(
                 onLog("[2/3] Extracting Microsoft VS Code from APK ($asset)")
                 extractAsset(
                     asset, prootManager.vscodeDir, StripMode.STRIP_ONE,
-                    W_ROOTFS, W_VSCODE, STEP_2, reporter
+                    wRootfs, wVscode, STEP_2, reporter
                 )
                 if (!File(prootManager.vscodeDir, "bin/code").exists()) {
                     throw IOException("VS Code archive did not contain bin/code")
                 }
                 prootManager.vscodeMarker.writeText("ok\n")
             } else {
-                reporter.update(W_ROOTFS + W_VSCODE, STEP_2, "Already installed", force = true)
+                reporter.update(wRootfs + wVscode, STEP_2, "Already installed", force = true)
                 onLog("[2/3] VS Code already installed.")
             }
 
             // ---- 3/3 Environment (init-rootfs.sh) -----------------------------------------------
             if (!prootManager.setupMarker.exists()) {
                 onLog("[3/3] Configuring the Linux environment (internet required for this step)…")
-                val base = W_ROOTFS + W_VSCODE
+                val base = wRootfs + wVscode
                 reporter.update(base, STEP_3, "Starting package setup…", force = true)
-                val env = EnvProgress(base, W_ENV, reporter)
+                val env = EnvProgress(base, wEnv, reporter)
                 val provisionWorkspace = File(prootManager.filesDir, "provision-workspace").apply { mkdirs() }
                 val p = prootManager.startProotCommand(
                     command = "bash /root/init-rootfs.sh",
@@ -151,7 +158,7 @@ class StandaloneProvisioner(
                 if (exit != 0) throw IOException("Environment setup exited with code $exit (check your internet connection and retry)")
                 if (!prootManager.setupMarker.exists()) throw IOException("Environment setup did not finish")
             } else {
-                onLog("[3/3] Environment already configured.")
+                onLog("[3/3] Environment already configured" + if (baked) " (pre-installed in the bundled image)." else ".")
             }
 
             reporter.update(100, "Setup complete", "Ready to launch", force = true)
@@ -346,9 +353,19 @@ class StandaloneProvisioner(
         }
 
         val mapper = PathMapper(mode)
-        val buffer = ByteArray(64 * 1024)
+        val buffer = ByteArray(128 * 1024)
         var files = 0
         var skipped = 0
+
+        // One mkdirs() per directory instead of one per file (tar entries of a directory are contiguous).
+        var lastParent: Path? = null
+        fun ensureParent(target: Path) {
+            val parent = target.parent ?: return
+            if (parent != lastParent) {
+                parent.toFile().mkdirs()
+                lastParent = parent
+            }
+        }
 
         TarArchiveInputStream(decompressed).use { tar ->
             var entry: TarArchiveEntry? = tar.nextTarEntry
@@ -361,7 +378,7 @@ class StandaloneProvisioner(
                             entry.isDirectory -> target.toFile().mkdirs()
 
                             entry.isSymbolicLink -> {
-                                target.parent?.toFile()?.mkdirs()
+                                ensureParent(target)
                                 Files.deleteIfExists(target)
                                 Files.createSymbolicLink(target, Paths.get(entry.linkName))
                             }
@@ -370,7 +387,7 @@ class StandaloneProvisioner(
                                 val linkRel = mapper.map(entry.linkName, learn = false)
                                 if (linkRel != null) {
                                     val source = safeResolve(root, linkRel)
-                                    target.parent?.toFile()?.mkdirs()
+                                    ensureParent(target)
                                     Files.copy(source, target, StandardCopyOption.REPLACE_EXISTING)
                                     if (Files.isExecutable(source)) target.toFile().setExecutable(true, false)
                                 }
@@ -379,7 +396,7 @@ class StandaloneProvisioner(
                             entry.isCharacterDevice || entry.isBlockDevice || entry.isFIFO -> skipped++
 
                             else -> {
-                                target.parent?.toFile()?.mkdirs()
+                                ensureParent(target)
                                 if (Files.isSymbolicLink(target)) Files.delete(target)
                                 FileOutputStream(target.toFile()).use { out ->
                                     while (true) {
@@ -469,9 +486,11 @@ class StandaloneProvisioner(
         private const val STEP_1 = "Step 1/3 · Extracting Debian Linux"
         private const val STEP_2 = "Step 2/3 · Extracting Visual Studio Code"
         private const val STEP_3 = "Step 3/3 · Setting up the environment"
+        private const val BAKED_FLAG = "rootfs-baked"
         private const val W_ROOTFS = 15
         private const val W_VSCODE = 15
-        private const val W_ENV = 70
+        private const val W_ROOTFS_BAKED = 70
+        private const val W_VSCODE_BAKED = 25
         private const val MB = 1024L * 1024L
 
         private val STANDARD_DIRS = setOf(

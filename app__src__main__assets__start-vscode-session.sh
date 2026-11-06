@@ -106,28 +106,85 @@ if [ -f /root/.pocket-geometry ]; then
     if printf '%s' "$CUSTOM" | grep -Eq '^[0-9]{3,4}x[0-9]{3,4}$'; then GEOMETRY="$CUSTOM"; fi
 fi
 
-echo "[start-vscode] Starting Embedded X11 Server (Xtigervnc :1, $GEOMETRY) & Openbox Window Manager..."
-Xtigervnc :1 \
-    -geometry "$GEOMETRY" \
-    -depth 24 \
-    -localhost \
-    -SecurityTypes None \
-    -AlwaysShared &
-sleep 2
+start_xserver() {
+    pkill -9 -f Xtigervnc 2>/dev/null
+    rm -rf /tmp/.X1-lock /tmp/.X11-unix/X1
+    echo "[start-vscode] Starting Embedded X11 Server (Xtigervnc :1, $GEOMETRY)..."
+    # MIT-SHM is switched off on purpose: it needs SysV shared memory, which Android blocks, and clients such as
+    # Electron then die with "XIO: fatal IO error 38 (Function not implemented)". Without it they send their
+    # images through the socket instead.
+    Xtigervnc :1 \
+        -geometry "$GEOMETRY" \
+        -depth 24 \
+        -localhost \
+        -SecurityTypes None \
+        -AlwaysShared \
+        -extension MIT-SHM &
+    sleep 2
+    if ! pgrep -x Xtigervnc >/dev/null 2>&1; then
+        echo "[start-vscode] Xtigervnc did not start with MIT-SHM disabled - retrying with the defaults."
+        rm -rf /tmp/.X1-lock /tmp/.X11-unix/X1
+        Xtigervnc :1 \
+            -geometry "$GEOMETRY" \
+            -depth 24 \
+            -localhost \
+            -SecurityTypes None \
+            -AlwaysShared &
+        sleep 2
+    fi
+}
+
+# Keeps the virtual screen, the window manager and the noVNC bridge alive: if VS Code crashes, the page in the app
+# must not go away (that was the "Web page not available / ERR_CONNECTION_REFUSED" screen).
+ensure_display() {
+    if ! pgrep -x Xtigervnc >/dev/null 2>&1; then
+        echo "[start-vscode] X server is not running - restarting it."
+        start_xserver
+    fi
+    if ! pgrep -x openbox >/dev/null 2>&1; then
+        openbox &
+    fi
+    if ! pgrep -f "websockify" >/dev/null 2>&1; then
+        websockify --web=/usr/share/novnc/ 127.0.0.1:6080 127.0.0.1:5901 &
+        sleep 1
+    fi
+}
 
 export DISPLAY=:1
+start_xserver
 openbox &
 websockify --web=/usr/share/novnc/ 127.0.0.1:6080 127.0.0.1:5901 &
 sleep 1
 
 echo "VSCODE_DISPLAY_READY"
-exec dbus-run-session -- /opt/vscode-arm64/bin/code \
-    --no-sandbox \
-    --disable-gpu \
-    --disable-gpu-sandbox \
-    --disable-dev-shm-usage \
-    --password-store="basic" \
-    --user-data-dir="/root/.config/Code" \
-    --extensions-dir="/root/.vscode/extensions" \
-    --wait \
-    "/root/Workspace"
+
+# If VS Code crashes (exit code != 0) it is started again and reopens the previous windows; closing it normally
+# (exit code 0) ends the session. Ten quick crashes in a row stop the loop.
+RESTARTS=0
+RC=0
+while true; do
+    ensure_display
+    STARTED=$(date +%s)
+    dbus-run-session -- /opt/vscode-arm64/bin/code \
+        --no-sandbox \
+        --disable-gpu \
+        --disable-gpu-sandbox \
+        --disable-dev-shm-usage \
+        --password-store="basic" \
+        --user-data-dir="/root/.config/Code" \
+        --extensions-dir="/root/.vscode/extensions" \
+        --wait \
+        "/root/Workspace"
+    RC=$?
+    echo "[start-vscode] VS Code exited with code $RC (signal $((RC > 128 ? RC - 128 : 0)))"
+    if [ "$RC" -eq 0 ]; then break; fi
+    if [ $(( $(date +%s) - STARTED )) -ge 120 ]; then RESTARTS=0; fi
+    RESTARTS=$((RESTARTS + 1))
+    if [ "$RESTARTS" -gt 10 ]; then
+        echo "[start-vscode] VS Code keeps crashing - giving up."
+        break
+    fi
+    echo "[start-vscode] VS Code crashed - restarting in 3 s (attempt $RESTARTS of 10)."
+    sleep 3
+done
+exit "$RC"

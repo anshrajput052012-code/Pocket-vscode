@@ -47,6 +47,24 @@ Push to `main` (or run the workflow manually): *Actions → Build Standalone VS 
 **Releases**. Local builds additionally need `fetch-native-proot.sh`, the bundled assets and generated icons, so the
 GitHub Actions build is the supported path.
 
+## Both modes share everything
+* **Project files** live in the same folder (`/root/Workspace`) in both modes.
+* **Settings, keybindings, snippets and extensions** are shared: Mode 2's server folders are relative symbolic links
+  to the desktop (Mode 1) folders (`~/.config/Code/User`, `~/.vscode/extensions`), so what you change in one mode is
+  there in the other. (Open tabs of Mode 2 are kept by the browser view and are not shared. Because the settings are
+  shared, the 0.5 s auto-save of Mode 2 also applies to Mode 1.)
+* **One mode at a time:** launching a mode stops the other one first, so the shared databases are never open twice.
+  Stopping Mode 1 / Mode 2 this way does not lose files if auto-save is on (it is, by default).
+
+## If Mode 1 crashes
+* The start script now restarts VS Code automatically after a crash (up to ten quick crashes in a row) and keeps the
+  virtual screen and the noVNC bridge alive, so the page in the app no longer turns into "Web page not available".
+  The log shows the exit code, e.g. `exited with code 137 (signal 9)` = killed by Android.
+* PRoot is started with `--sysvipc` when the bundled proot supports it, and the virtual screen runs without MIT-SHM
+  (both avoid `XIO: fatal IO error 38 (Function not implemented)`).
+* Android 12+ kills "phantom" child processes of apps that spawn many (Electron does). On Android 14/15 turn on
+  **Settings → Developer options → Disable child process restrictions** (then reboot) if crashes continue.
+
 ## How the fast first start works (CI "pre-bake")
 The workflow downloads the Debian arm64 rootfs, runs `app/src/main/assets/init-rootfs.sh` inside it on the GitHub
 runner (arm64 emulation via qemu), trims docs/man pages/locales/apt caches, turns big hard-linked files into symlinks,

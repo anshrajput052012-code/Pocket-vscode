@@ -12,6 +12,7 @@ import java.io.InputStreamReader
 import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.file.Files
+import java.nio.file.Paths
 import java.util.concurrent.TimeUnit
 
 /**
@@ -82,6 +83,10 @@ class AppPrefs(context: Context) {
 object Mode1Session {
     @Volatile
     var process: Process? = null
+
+    /** True from the moment the user taps Launch until the process exists (keeps the service alive meanwhile). */
+    @Volatile
+    var starting: Boolean = false
 
     val isAlive: Boolean
         get() = process?.isAlive == true
@@ -185,6 +190,7 @@ object Mode2Server {
     fun start(manager: ProotProcessManager, workspaceHostPath: String): Process {
         process?.let { if (it.isAlive) return it }
 
+        manager.ensureSharedState()
         manager.ensureMode2Settings()
         touchHeartbeat(manager)
         val p = manager.startProotCommand(
@@ -332,6 +338,49 @@ class ProotProcessManager(context: Context) {
             f.writeText(text)
         } catch (_: Exception) {
         }
+    }
+
+    private val supportsSysvipc: Boolean by lazy {
+        try {
+            String(prootBinary.readBytes(), Charsets.ISO_8859_1).contains("--sysvipc")
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
+     * Mode 1 and Mode 2 share settings, keybindings, snippets and extensions: Mode 2's server data folders are
+     * symbolic links to the desktop (Mode 1) folders. The links are relative, so they resolve on the phone and
+     * inside PRoot alike. The app runs only one mode at a time, so the shared databases are never open twice.
+     * Anything Mode 2 already had is kept (moved over, or set aside as ".pre-share-…").
+     */
+    fun ensureSharedState() {
+        try {
+            val sharedUser = File(homeDir, ".config/Code/User").apply { mkdirs() }
+            val sharedExtensions = File(homeDir, ".vscode/extensions").apply { mkdirs() }
+            File(homeDir, ".vscode-server-data/data").mkdirs()
+            linkToShared(File(homeDir, ".vscode-server-data/data/User"), "../../.config/Code/User", sharedUser)
+            linkToShared(File(homeDir, ".vscode-server-data/extensions"), "../.vscode/extensions", sharedExtensions)
+        } catch (e: Exception) {
+            AppLog.add("Warning: could not share settings/extensions between the modes: ${e.message}")
+        }
+    }
+
+    private fun linkToShared(link: File, relativeTarget: String, shared: File) {
+        val path = link.toPath()
+        if (Files.isSymbolicLink(path)) return
+        if (link.exists()) {
+            val movedOver = link.isDirectory && shared.list().isNullOrEmpty() && shared.delete() && link.renameTo(shared)
+            if (!movedOver) {
+                shared.mkdirs()
+                if (!link.renameTo(File(link.parentFile, link.name + ".pre-share-" + System.currentTimeMillis()))) {
+                    AppLog.add("Warning: ${link.name} could not be shared between the modes (kept as it is).")
+                    return
+                }
+            }
+        }
+        link.parentFile?.mkdirs()
+        Files.createSymbolicLink(path, Paths.get(relativeTarget))
     }
 
     /**
@@ -500,6 +549,10 @@ class ProotProcessManager(context: Context) {
             "/bin/bash", "-c", command
         )
 
+        // SysV shared memory emulation (Android blocks the real one). X11 / Electron need it; only used when this
+        // proot build actually offers the option, so an older binary can never fail to start because of it.
+        if (supportsSysvipc) cmdList.add(1, "--sysvipc")
+
         val pb = ProcessBuilder(cmdList)
         val env = pb.environment()
         env["PROOT_TMP_DIR"] = tmpDir.absolutePath
@@ -531,6 +584,6 @@ class ProotProcessManager(context: Context) {
     companion object {
         val ASSET_SCRIPTS: List<String> = listOf("init-rootfs.sh", "start-vscode-session.sh", "verify-vscode.sh")
 
-        fun isAnySessionAlive(): Boolean = Mode1Session.isAlive || Mode2Server.isProcessAlive
+        fun isAnySessionAlive(): Boolean = Mode1Session.isAlive || Mode1Session.starting || Mode2Server.isProcessAlive
     }
 }
