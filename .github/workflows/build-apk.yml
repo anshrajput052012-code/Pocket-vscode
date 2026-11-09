@@ -558,6 +558,43 @@ jobs:
           done
           ls -l "$DEST"
 
+      - name: Recompress the big archives with zstd (APK about a quarter smaller, unpacks as fast or faster)
+        run: |
+          set -euo pipefail
+          cd app/src/main/assets
+          command -v zstd >/dev/null 2>&1 || { sudo apt-get update -qq && sudo apt-get install -y zstd; }
+          command -v pigz >/dev/null 2>&1 || sudo apt-get install -y pigz
+          zstd --version
+
+          ls -l
+          BEFORE=0
+          for f in debian-rootfs.tar.gz debian-rootfs.tar.xz vscode-linux-arm64.tar.gz; do
+            [ -f "$f" ] || continue
+            BEFORE=$(( BEFORE + $(stat -c %s "$f") ))
+            case "$f" in
+              *.gz) DECODE="pigz -dc" ;;
+              *.xz) DECODE="xz -dc" ;;
+            esac
+            OUT="${f%.*}.zst"
+            echo "=== $f -> $OUT ==="
+            # level 19 (slow to write, very fast to read) with a 64 MiB window; the phone only ever decompresses
+            $DECODE "$f" | zstd -19 --long=26 -T0 -q -f -o "$OUT"
+            zstd -t "$OUT"
+            # the decompressed stream must be byte-identical to the original one
+            A=$($DECODE "$f" | sha256sum | cut -d' ' -f1)
+            B=$(zstd -dc "$OUT" | sha256sum | cut -d' ' -f1)
+            if [ "$A" != "$B" ]; then echo "::error::$OUT does not decompress to the same data as $f"; exit 1; fi
+            echo "$f: $(stat -c %s "$f") bytes  ->  $OUT: $(stat -c %s "$OUT") bytes"
+            rm -f "$f"
+          done
+          AFTER=0
+          for f in debian-rootfs.tar.zst vscode-linux-arm64.tar.zst; do
+            [ -f "$f" ] || { echo "::error::$f was not produced"; exit 1; }
+            AFTER=$(( AFTER + $(stat -c %s "$f") ))
+          done
+          echo "archives together: $BEFORE bytes before, $AFTER bytes after zstd"
+          ls -l
+
       - name: Give the big archives a neutral file extension (the Android build unpacks *.gz assets)
         run: |
           cd app/src/main/assets
