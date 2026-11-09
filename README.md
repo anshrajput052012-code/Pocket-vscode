@@ -79,3 +79,21 @@ The CI build takes longer (qemu), the phone is much faster.
 
 ## Network notes
 * The first Mode 2 start may download the matching VS Code web server build (done by `code serve-web` itself).
+
+## Native Mode 1 viewer, smaller APK, storage cleanup
+
+* **Native viewer (default for Mode 1).** `RfbClient.kt` (RFB/VNC client, Raw + CopyRect + extended clipboard) and `VncView.kt`
+  (touch / mouse / S Pen / keyboard / on-screen keyboard) draw the Xtigervnc desktop directly: no WebView, no noVNC, no
+  websockify, real Android clipboard sync in both directions. The old noVNC page stays available as a fallback
+  ("Mode 1 viewer" in the app; stored as `/root/.pocket-viewer`, read by `start-vscode-session.sh`).
+  Touch: tap = click, hold then drag = select, drag = scroll (momentum), two fingers = scroll, two-finger tap = right click.
+  Mouse/touchpad/S Pen work like on a computer (S Pen button = right click). Floating buttons on the right edge:
+  `KB` on-screen keyboard, `Keys` Esc/Tab/Ctrl/Alt/Shift/Win/arrows/F1-F12/Copy/Paste row, `Fit` (with the keyboard up:
+  whole desktop vs. zoomed to width following the pointer).
+* **Latency.** Direct loopback TCP, Raw encoding, TCP_NODELAY, vsync-aligned drawing, and Xtigervnc `-FrameRate=120`.
+* **Size.** CI re-packs the Debian rootfs and the VS Code archive with zstd (-19): the APK is roughly a quarter smaller and
+  unpacking is not slower than gzip. The app picks the format from the file's magic number (zstd / gzip / xz).
+  Updating an installed app never re-extracts anything.
+* **Storage.** Old Mode 2 server downloads (`~/.vscode/cli/serve-web`, up to five versions of a few hundred MB, never used
+  again) are removed after a week, the newest is always kept; old logs go too. "Free up space" in the app does it at once
+  and also clears download/compiler caches. Mode 2 itself is unchanged.

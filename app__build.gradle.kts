@@ -35,12 +35,13 @@ android {
         }
     }
 
-    // The bundled Debian rootfs / VS Code archives are already compressed: store them as-is. This keeps the
+    // The bundled Debian rootfs / VS Code archives are already compressed (CI packs them with zstd, about a quarter
+    // smaller than gzip and quicker to unpack): store them as-is. This keeps the
     // APK build fast and lets the app read the exact asset size for the real progress percentage.
     // ("pkg" = the CI renames the .tar.gz archives to *.tar.gz.pkg because the Android build silently UNPACKS assets
     // that end in ".gz", which made the APK 2.2 GB instead of 0.7 GB.)
     androidResources {
-        noCompress.addAll(listOf("xz", "gz", "tar", "pkg"))
+        noCompress.addAll(listOf("xz", "gz", "tar", "pkg", "zst"))
     }
 
     packaging {
@@ -78,4 +79,6 @@ dependencies {
     implementation("androidx.webkit:webkit:1.11.0")
     implementation("org.apache.commons:commons-compress:1.26.2")
     implementation("org.tukaani:xz:1.9")
+    // zstd decoder for the bundled archives (commons-compress' Zstd stream calls into it). The AAR carries the arm64 library.
+    implementation("com.github.luben:zstd-jni:1.5.6-9@aar")
 }

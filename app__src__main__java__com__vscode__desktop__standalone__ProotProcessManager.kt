@@ -2,6 +2,7 @@ package com.vscode.desktop.standalone
 
 import android.content.Context
 import android.os.Environment
+import org.json.JSONArray
 import org.json.JSONException
 import org.json.JSONObject
 import java.io.BufferedReader
@@ -11,8 +12,13 @@ import java.io.IOException
 import java.io.InputStreamReader
 import java.net.HttpURLConnection
 import java.net.URL
+import java.nio.file.FileVisitResult
 import java.nio.file.Files
+import java.nio.file.LinkOption
+import java.nio.file.Path
 import java.nio.file.Paths
+import java.nio.file.SimpleFileVisitor
+import java.nio.file.attribute.BasicFileAttributes
 import java.util.concurrent.TimeUnit
 
 /**
@@ -69,7 +75,27 @@ class AppPrefs(context: Context) {
             sp.edit().putString("mode1_quality", value).apply()
         }
 
+    /** Mode 1 viewer: [VIEWER_NATIVE] (default: built-in viewer, real Android copy/paste) or [VIEWER_WEB] (noVNC in a WebView). */
+    var mode1Viewer: String
+        get() = when (val v = sp.getString("mode1_viewer", VIEWER_NATIVE) ?: VIEWER_NATIVE) {
+            VIEWER_NATIVE, VIEWER_WEB -> v
+            else -> VIEWER_NATIVE
+        }
+        set(value) {
+            sp.edit().putString("mode1_viewer", value).apply()
+        }
+
+    /** The one-time gesture hint of the native viewer has been shown. */
+    var shownNativeHint: Boolean
+        get() = sp.getBoolean("shown_native_hint", false)
+        set(value) {
+            sp.edit().putBoolean("shown_native_hint", value).apply()
+        }
+
     companion object {
+        const val VIEWER_NATIVE = "native"
+        const val VIEWER_WEB = "web"
+
         const val QUALITY_BALANCED = "balanced"
         const val QUALITY_SHARP = "sharp"
         const val QUALITY_NATIVE = "native"
@@ -381,6 +407,145 @@ class ProotProcessManager(context: Context) {
         }
         link.parentFile?.mkdirs()
         Files.createSymbolicLink(path, Paths.get(relativeTarget))
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Storage housekeeping. Only regenerable leftovers are removed: old Mode 2 server downloads (the newest is always
+    // kept), old logs, download and compiler caches. Settings, extensions, projects and Mode 2's behaviour are untouched.
+    // ---------------------------------------------------------------------------------------------
+
+    /** Deletes a file or folder (never following symbolic links). Returns the bytes freed. */
+    private fun deleteTree(root: File): Long {
+        var freed = 0L
+        val start = root.toPath()
+        if (!Files.exists(start, LinkOption.NOFOLLOW_LINKS)) return 0L
+        try {
+            Files.walkFileTree(start, object : SimpleFileVisitor<Path>() {
+                override fun preVisitDirectory(dir: Path, attrs: BasicFileAttributes): FileVisitResult {
+                    dir.toFile().setWritable(true, true)
+                    return FileVisitResult.CONTINUE
+                }
+
+                override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
+                    try {
+                        val size = attrs.size()
+                        Files.delete(file)
+                        freed += size
+                    } catch (_: IOException) {
+                    }
+                    return FileVisitResult.CONTINUE
+                }
+
+                override fun visitFileFailed(file: Path, exc: IOException): FileVisitResult = FileVisitResult.CONTINUE
+
+                override fun postVisitDirectory(dir: Path, exc: IOException?): FileVisitResult {
+                    try {
+                        Files.delete(dir)
+                    } catch (_: IOException) {
+                    }
+                    return FileVisitResult.CONTINUE
+                }
+            })
+        } catch (e: Exception) {
+            AppLog.add("Cleanup: ${e.message}")
+        }
+        return freed
+    }
+
+    /** Deletes the entries of [dir] that were last changed more than [olderThanMs] ago (0 = all of them). */
+    private fun deleteChildren(dir: File, olderThanMs: Long): Long {
+        val kids = dir.listFiles() ?: return 0L
+        val cutoff = System.currentTimeMillis() - olderThanMs
+        var freed = 0L
+        for (k in kids) if (olderThanMs <= 0L || k.lastModified() < cutoff) freed += deleteTree(k)
+        return freed
+    }
+
+    /**
+     * `code serve-web` (Mode 2) keeps up to five downloaded server versions (a few hundred MB each) and never uses the
+     * old ones again. Everything except the newest version is deleted once it is [minAgeMs] old. Skipped while Mode 2
+     * is running. The CLI copes with missing folders (it simply downloads again if it ever needs one).
+     */
+    fun pruneOldServerVersions(minAgeMs: Long): Long {
+        if (Mode2Server.isProcessAlive || Mode2Server.externalSession) return 0L
+        val base = File(homeDir, ".vscode/cli/serve-web")
+        val all = base.listFiles() ?: return 0L
+        val hex = Regex("[0-9a-f]{40}")
+        val versions = all.filter { it.isDirectory && hex.matches(it.name) }
+        val keep = HashSet<String>()
+        try {
+            val lru = JSONArray(File(base, "lru.json").readText())
+            if (lru.length() > 0) keep.add(lru.getString(0))
+        } catch (_: Exception) {
+        }
+        versions.maxByOrNull { it.lastModified() }?.let { keep.add(it.name) }
+        val cutoff = System.currentTimeMillis() - minAgeMs
+        var freed = 0L
+        for (v in versions) {
+            if (v.name !in keep && v.lastModified() < cutoff) freed += deleteTree(v)
+        }
+        // half-finished downloads of earlier attempts
+        for (f in all) {
+            if (f.name.contains(".staging-") && f.lastModified() < System.currentTimeMillis() - 24L * 3600 * 1000) {
+                freed += deleteTree(f)
+            }
+        }
+        if (freed > 0) AppLog.add("Cleanup: removed old Mode 2 server downloads (${freed / (1024 * 1024)} MB).")
+        return freed
+    }
+
+    /** Quiet, automatic part: old Mode 2 server versions (a week old or more) and logs older than three days. */
+    fun autoHousekeeping() {
+        try {
+            var freed = pruneOldServerVersions(7L * 24 * 3600 * 1000)
+            val day = 24L * 3600 * 1000
+            freed += deleteChildren(File(homeDir, ".config/Code/logs"), 3 * day)
+            freed += deleteChildren(File(homeDir, ".vscode-server-data/data/logs"), 3 * day)
+            freed += deleteChildren(File(homeDir, ".config/Code/CachedExtensionVSIXs"), day)
+            freed += deleteChildren(File(homeDir, ".npm/_logs"), 7 * day)
+            if (freed > 0) AppLog.add("Cleanup: freed ${freed / (1024 * 1024)} MB of old leftovers.")
+        } catch (e: Exception) {
+            AppLog.add("Cleanup skipped: ${e.message}")
+        }
+    }
+
+    /**
+     * The "Free up space" button: everything in [autoHousekeeping] right away, plus download / compiler caches and, while
+     * Mode 1 is not running, VS Code's own caches (they are rebuilt on the next start). Returns the bytes freed.
+     */
+    fun freeUpSpace(): Long {
+        var freed = 0L
+        try {
+            freed += pruneOldServerVersions(0L)
+            freed += deleteChildren(File(homeDir, ".config/Code/logs"), 0L)
+            freed += deleteChildren(File(homeDir, ".config/Code/CachedExtensionVSIXs"), 0L)
+            freed += deleteChildren(File(homeDir, ".config/Code/Crashpad"), 0L)
+            freed += deleteChildren(File(homeDir, ".npm/_logs"), 0L)
+            freed += deleteTree(File(homeDir, ".npm/_cacache"))
+            freed += deleteTree(File(homeDir, ".cache/pip"))
+            freed += deleteTree(File(homeDir, ".cache/node-gyp"))
+            if (!Mode2Server.isProcessAlive) freed += deleteChildren(File(homeDir, ".vscode-server-data/data/logs"), 0L)
+            if (!Mode1Session.isAlive) {
+                for (n in listOf("Cache", "Code Cache", "GPUCache", "DawnCache", "CachedData")) {
+                    freed += deleteTree(File(homeDir, ".config/Code/$n"))
+                }
+            }
+            freed += deleteChildren(context.cacheDir, 0L)
+        } catch (e: Exception) {
+            AppLog.add("Free up space: ${e.message}")
+        }
+        AppLog.add("Free up space: ${freed / (1024 * 1024)} MB freed.")
+        return freed
+    }
+
+    /** Mode 1: tells the start script whether the app shows the desktop itself (native: no noVNC / websockify needed). */
+    fun writeMode1Viewer(native: Boolean) {
+        try {
+            homeDir.mkdirs()
+            File(homeDir, ".pocket-viewer").writeText(if (native) "native\n" else "web\n")
+        } catch (e: Exception) {
+            AppLog.add("Warning: could not store the Mode 1 viewer choice: ${e.message}")
+        }
     }
 
     /**

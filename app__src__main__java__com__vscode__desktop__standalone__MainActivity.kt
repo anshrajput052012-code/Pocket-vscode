@@ -3,6 +3,9 @@ package com.vscode.desktop.standalone
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.ActivityNotFoundException
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
@@ -21,12 +24,15 @@ import android.provider.Settings
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
+import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Button
 import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.RadioButton
@@ -47,7 +53,8 @@ import java.io.File
  *   LOADING : the moment a folder is chosen, Debian + VS Code are extracted from the APK and the environment is set
  *             up in a background thread, with a live 0-100 % progress bar
  *   READY   : choose Mode 1 (full Electron desktop) or Mode 2 (native web host) and launch
- *   MODE1   : embedded noVNC surface (Back returns to READY; Mode 2 opens in WorkbenchActivity)
+ *   MODE1   : the desktop, shown by the built-in native viewer (VncView) or, as a fallback, an embedded noVNC page
+ *             (Back returns to READY; Mode 2 opens in WorkbenchActivity)
  */
 class MainActivity : AppCompatActivity(), ProvisionListener {
 
@@ -73,15 +80,35 @@ class MainActivity : AppCompatActivity(), ProvisionListener {
     private lateinit var modeGroup: RadioGroup
     private lateinit var qualityBox: LinearLayout
     private lateinit var qualityGroup: RadioGroup
+    private lateinit var nativeQualityRadio: RadioButton
+    private lateinit var viewerBox: LinearLayout
+    private lateinit var viewerGroup: RadioGroup
     private lateinit var launchButton: Button
     private lateinit var verifyButton: Button
     private lateinit var statusText: TextView
     private lateinit var logView: TextView
 
     private var mode1WebView: WebView? = null
+
+    // Mode 1, native viewer: the desktop view, the little buttons floating over it and the extra key row under it
+    private var vncView: VncView? = null
+    private var contentRoot: FrameLayout? = null // the app's whole content area (set once the UI is built)
+    private var nativeFrame: FrameLayout? = null
+    private var keysBar: View? = null
+    private val latchButtons = HashMap<Int, Button>()
+    private var activeNativeViewer = true // the viewer the running (or starting) Mode 1 session uses
+    private var lastSyncedClip = ""
+    private var housekeepingDone = false
     private var currentScreen = Screen.FOLDER
     private val ui = Handler(Looper.getMainLooper())
     private var logRefreshScheduled = false
+
+    // Mode 1: page-load retry, and the clipboard bridge (Android clipboard <-> the virtual desktop)
+    private var mode1LoadFailed = false
+    private var mode1LoadAttempts = 0
+    private var clipboardCache: String = ""
+    private var clipListenerRegistered = false
+    private val clipListener = ClipboardManager.OnPrimaryClipChangedListener { syncAndroidClipboardToDesktop() }
 
     // ---------------------------------------------------------------------------------------------
     // Activity-result launchers (must be registered before the Activity is STARTED)
@@ -135,7 +162,21 @@ class MainActivity : AppCompatActivity(), ProvisionListener {
         super.onStop()
     }
 
+    override fun onResume() {
+        super.onResume()
+        syncAndroidClipboardToDesktop()
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        // Android only lets the focused app read the clipboard, so text copied in another app is picked up here.
+        if (hasFocus) syncAndroidClipboardToDesktop()
+    }
+
     override fun onDestroy() {
+        unregisterClipboardListener()
+        vncView?.stop()
+        vncView = null
         mode1WebView?.destroy()
         mode1WebView = null
         super.onDestroy()
@@ -204,6 +245,7 @@ class MainActivity : AppCompatActivity(), ProvisionListener {
         loadingScreen.visibility = if (screen == Screen.LOADING) View.VISIBLE else View.GONE
         readyScreen.visibility = if (screen == Screen.READY) View.VISIBLE else View.GONE
         mode1Container.visibility = if (screen == Screen.MODE1) View.VISIBLE else View.GONE
+        if (screen != Screen.MODE1) leaveNativeViewer()
     }
 
     private fun showReady() {
@@ -212,11 +254,17 @@ class MainActivity : AppCompatActivity(), ProvisionListener {
             "direct" -> modeGroup.check(ID_MODE2)
             else -> modeGroup.check(ID_MODE1)
         }
-        qualityBox.visibility = if (modeGroup.checkedRadioButtonId == ID_MODE2) View.GONE else View.VISIBLE
+        updateMode1OptionsVisibility()
+        // "Native" = the exact size of the area the desktop will fill (known now that the screen is laid out)
+        readyScreen.post {
+            val (nw, nh) = nativeScreenSize()
+            nativeQualityRadio.text = "Native · ${nw}×${nh}\nthis screen's own size: sharpest, heaviest"
+        }
         launchButton.isEnabled = true
         launchButton.alpha = 1f
         statusText.text = "Setup complete · 100%. Choose a mode and launch."
         showScreen(Screen.READY)
+        runHousekeepingOnce()
         refreshLogViews()
     }
 
@@ -341,9 +389,13 @@ class MainActivity : AppCompatActivity(), ProvisionListener {
         startActivity(Intent(this, WorkbenchActivity::class.java))
     }
 
-    /** Mode 1: full Electron desktop through Xtigervnc + Openbox + noVNC (not throttled). */
+    /** Mode 1: full Electron desktop through Xtigervnc + Openbox, shown by the native viewer (or noVNC as a fallback). */
     private fun launchMode1() {
         val workspace = prefs.workspace ?: AppPrefs.defaultWorkspace()
+        val nativeViewer = prefs.mode1Viewer == AppPrefs.VIEWER_NATIVE
+        activeNativeViewer = nativeViewer
+        // nothing of a previous session may stay on screen or keep connecting
+        vncView?.stop()
         launchButton.isEnabled = false
         launchButton.alpha = 0.5f
         statusText.text = "Starting Mode 1 (Xtigervnc + Openbox + VS Code)…"
@@ -362,6 +414,7 @@ class MainActivity : AppCompatActivity(), ProvisionListener {
                 Mode1Session.stop()
                 prootManager.ensureSharedState()
                 prootManager.writeMode1Geometry(screenW, screenH)
+                prootManager.writeMode1Viewer(nativeViewer)
                 val p = prootManager.startProotCommand(
                     command = "bash /root/start-vscode-session.sh x11",
                     workspaceHostPath = workspace,
@@ -407,9 +460,23 @@ class MainActivity : AppCompatActivity(), ProvisionListener {
             wv.settings.loadWithOverviewMode = true
             wv.settings.setSupportZoom(true)
             wv.webChromeClient = WebChromeClient()
+            wv.addJavascriptInterface(ClipboardBridge(), "PocketClip")
             wv.webViewClient = object : WebViewClient() {
                 override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean = false
+
+                override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
+                    // Only the page itself matters (not a missing icon). The desktop's web bridge can need a moment
+                    // after the app asks for it: try again instead of staying on "Web page not available".
+                    if (request?.isForMainFrame == true) retryMode1Load(view)
+                }
+
+                override fun onPageFinished(view: WebView?, url: String?) {
+                    if (!mode1LoadFailed && view != null && url != null && url.startsWith(MODE1_BASE_URL)) {
+                        view.evaluateJavascript(CLIPBOARD_BRIDGE_JS, null)
+                    }
+                }
             }
+            registerClipboardListener()
             mode1Container.addView(wv)
             wv
         } catch (e: Throwable) {
@@ -420,14 +487,304 @@ class MainActivity : AppCompatActivity(), ProvisionListener {
     }
 
     private fun showMode1Surface() {
+        if (activeNativeViewer) {
+            showNativeSurface()
+            return
+        }
         val wv: WebView = mode1WebView ?: createMode1WebView() ?: return
         mode1WebView = wv
+        wv.visibility = View.VISIBLE
+        nativeFrame?.visibility = View.GONE
+        keysBar?.visibility = View.GONE
+        vncView?.stop()
         val firstShow = currentScreen != Screen.MODE1
         showScreen(Screen.MODE1)
         if (firstShow) Toast.makeText(this, "Back = Setup / Logs", Toast.LENGTH_SHORT).show()
         // resize=scale: keep the fixed (light) server resolution and let the WebView scale it. "remote" would make the
         // server grow to the tablet's full pixel size, which is much heavier. Local loopback: low compression = less CPU.
-        wv.loadUrl("http://127.0.0.1:6080/vnc.html?autoconnect=true&resize=scale&quality=6&compression=2")
+        mode1LoadAttempts = 0
+        mode1LoadFailed = false
+        wv.loadUrl(MODE1_URL)
+    }
+
+    /** The first page load can hit the web bridge a moment too early: reload every 1.5 s (up to about a minute). */
+    private fun retryMode1Load(view: WebView?) {
+        mode1LoadFailed = true
+        if (view == null) return
+        if (mode1LoadAttempts >= MODE1_MAX_LOAD_ATTEMPTS) {
+            AppLog.add("Mode 1 page did not load after $mode1LoadAttempts tries - press Back and launch Mode 1 again.")
+            return
+        }
+        mode1LoadAttempts++
+        ui.postDelayed({
+            if (currentScreen == Screen.MODE1 && mode1WebView === view && mode1LoadFailed) {
+                mode1LoadFailed = false
+                view.loadUrl(MODE1_URL)
+            }
+        }, 1500)
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Mode 1 clipboard: Android clipboard <-> VS Code, without the noVNC clipboard box
+    // ---------------------------------------------------------------------------------------------
+
+    /** Called from the noVNC page (see CLIPBOARD_BRIDGE_JS). */
+    private inner class ClipboardBridge {
+        /** Last known text of the Android clipboard (read on the main thread, never from the web thread). */
+        @JavascriptInterface
+        fun get(): String = clipboardCache
+
+        /** Text copied inside VS Code -> Android clipboard. */
+        @JavascriptInterface
+        fun set(text: String?) {
+            if (text.isNullOrEmpty()) return
+            runOnUiThread {
+                try {
+                    clipboardCache = text // so the change listener does not send it straight back
+                    val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                    cm.setPrimaryClip(ClipData.newPlainText("VS Code", text))
+                } catch (e: Throwable) {
+                    AppLog.add("Clipboard: could not copy from VS Code: ${e.message}")
+                }
+            }
+        }
+    }
+
+    private fun readAndroidClipboard(): String {
+        return try {
+            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            val clip = cm.primaryClip
+            if (clip != null && clip.itemCount > 0) clip.getItemAt(0).coerceToText(this)?.toString() ?: "" else ""
+        } catch (e: Throwable) {
+            ""
+        }
+    }
+
+    private fun registerClipboardListener() {
+        if (clipListenerRegistered) return
+        try {
+            (getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).addPrimaryClipChangedListener(clipListener)
+            clipListenerRegistered = true
+        } catch (e: Throwable) {
+            AppLog.add("Clipboard listener unavailable: ${e.message}")
+        }
+    }
+
+    private fun unregisterClipboardListener() {
+        if (!clipListenerRegistered) return
+        try {
+            (getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).removePrimaryClipChangedListener(clipListener)
+        } catch (e: Throwable) {
+        }
+        clipListenerRegistered = false
+    }
+
+    /** Tell the page that the Android clipboard may have changed; the page then pulls it through ClipboardBridge. */
+    private fun syncAndroidClipboardToDesktop() {
+        if (currentScreen != Screen.MODE1) return
+        if (activeNativeViewer) {
+            // native viewer: hand the text straight to the desktop's clipboard over the VNC connection
+            val v = vncView ?: return
+            val text = readAndroidClipboard()
+            if (text.isNotEmpty() && text != lastSyncedClip) {
+                lastSyncedClip = text
+                v.sendClipboardToDesktop(text)
+            }
+            return
+        }
+        val wv = mode1WebView ?: return
+        clipboardCache = readAndroidClipboard()
+        wv.evaluateJavascript("window.pocketSync && window.pocketSync()", null)
+    }
+
+    /** Text copied inside VS Code (native viewer) -> Android clipboard. */
+    private fun applyDesktopClipboard(text: String) {
+        if (text.isEmpty()) return
+        try {
+            lastSyncedClip = text // so the change listener does not send it straight back
+            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            cm.setPrimaryClip(ClipData.newPlainText("VS Code", text))
+        } catch (e: Throwable) {
+            AppLog.add("Clipboard: could not copy from VS Code: ${e.message}")
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Mode 1, native viewer
+    // ---------------------------------------------------------------------------------------------
+
+    private fun showNativeSurface() {
+        val v = vncView ?: createNativeViewer()
+        mode1WebView?.let {
+            it.visibility = View.GONE
+            it.loadUrl("about:blank")
+        }
+        nativeFrame?.visibility = View.VISIBLE
+        keysBar?.visibility = View.GONE
+        val firstShow = currentScreen != Screen.MODE1
+        showScreen(Screen.MODE1)
+        if (firstShow) {
+            val hint = if (!prefs.shownNativeHint) {
+                prefs.shownNativeHint = true
+                "Tap = click · hold, then drag = select · drag = scroll · two fingers: scroll / tap = right click · Back = Setup / Logs"
+            } else {
+                "Back = Setup / Logs"
+            }
+            Toast.makeText(this, hint, Toast.LENGTH_LONG).show()
+        }
+        lastSyncedClip = ""
+        v.start("127.0.0.1", 5901)
+        v.requestFocus()
+    }
+
+    /** Leaving the Mode 1 screen: no picture traffic, no on-screen keyboard left over. */
+    private fun leaveNativeViewer() {
+        val v = vncView ?: return
+        v.stop()
+        try {
+            (getSystemService(Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager)
+                .hideSoftInputFromWindow(v.windowToken, 0)
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun createNativeViewer(): VncView {
+        val v = VncView(this)
+        v.onDesktopClipboard = { text -> applyDesktopClipboard(text) }
+        v.onSessionReady = {
+            lastSyncedClip = ""
+            syncAndroidClipboardToDesktop()
+        }
+        v.onBeforePaste = { syncAndroidClipboardToDesktop() }
+        v.onLatchChanged = { refreshLatchButtons() }
+
+        val frame = FrameLayout(this)
+        frame.layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+        frame.addView(v, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+
+        // three small, see-through buttons on the right edge (a corner would cover VS Code's title / status bar)
+        val fabs = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            alpha = 0.55f
+        }
+        fabs.addView(floatingButton("KB") { v.toggleKeyboard() })
+        fabs.addView(floatingButton("Keys") { toggleKeysBar() })
+        fabs.addView(floatingButton("Fit") { v.toggleKeyboardFit() })
+        frame.addView(
+            fabs,
+            FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                gravity = Gravity.END or Gravity.CENTER_VERTICAL
+                rightMargin = dp(6)
+                bottomMargin = dp(120)
+            }
+        )
+
+        val bar = buildKeysBar(v)
+        bar.visibility = View.GONE
+
+        mode1Container.addView(frame)
+        mode1Container.addView(bar)
+        nativeFrame = frame
+        keysBar = bar
+        vncView = v
+        registerClipboardListener()
+        return v
+    }
+
+    private fun floatingButton(label: String, onClick: () -> Unit): Button = Button(this).apply {
+        text = label
+        isAllCaps = false
+        textSize = 12f
+        setTextColor(Color.WHITE)
+        stateListAnimator = null
+        minWidth = 0
+        minHeight = 0
+        minimumWidth = dp(46)
+        minimumHeight = dp(40)
+        setPadding(dp(6), dp(2), dp(6), dp(2))
+        background = GradientDrawable().apply {
+            setColor(0xFF2D2D30.toInt())
+            setStroke(dp(1), 0xFF6A6A6A.toInt())
+            cornerRadius = dp(10).toFloat()
+        }
+        layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            .apply { topMargin = dp(6) }
+        // the on-screen keyboard must not lose the desktop's focus when one of these is pressed
+        isFocusable = false
+        isFocusableInTouchMode = false
+        setOnClickListener { onClick(); vncView?.requestFocus() }
+    }
+
+    private fun toggleKeysBar() {
+        val bar = keysBar ?: return
+        bar.visibility = if (bar.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+    }
+
+    /** The keys a phone keyboard lacks. Ctrl / Alt / Shift / Win stay "on" for the next key; the rest is one tap. */
+    private fun buildKeysBar(v: VncView): View {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(4), dp(3), dp(4), dp(3))
+        }
+        fun key(label: String, action: () -> Unit): Button = Button(this).apply {
+            text = label
+            isAllCaps = false
+            textSize = 13f
+            setTextColor(Color.WHITE)
+            stateListAnimator = null
+            minWidth = 0
+            minHeight = 0
+            minimumWidth = dp(46)
+            minimumHeight = dp(40)
+            setPadding(dp(8), dp(2), dp(8), dp(2))
+            background = GradientDrawable().apply {
+                setColor(0xFF3C3C3C.toInt())
+                cornerRadius = dp(8).toFloat()
+            }
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                .apply { marginEnd = dp(4) }
+            isFocusable = false
+            isFocusableInTouchMode = false
+            setOnClickListener { action(); v.requestFocus() }
+        }
+        fun latch(label: String, mod: Int) {
+            val b = key(label) { v.toggleLatch(mod) }
+            latchButtons[mod] = b
+            row.addView(b)
+        }
+        row.addView(key("Esc") { v.tapKey(VncKeys.ESCAPE) })
+        row.addView(key("Tab") { v.tapKey(VncKeys.TAB) })
+        latch("Ctrl", VncView.MOD_CTRL)
+        latch("Alt", VncView.MOD_ALT)
+        latch("Shift", VncView.MOD_SHIFT)
+        latch("Win", VncView.MOD_SUPER)
+        row.addView(key("←") { v.tapKey(VncKeys.LEFT) })
+        row.addView(key("↑") { v.tapKey(VncKeys.UP) })
+        row.addView(key("↓") { v.tapKey(VncKeys.DOWN) })
+        row.addView(key("→") { v.tapKey(VncKeys.RIGHT) })
+        row.addView(key("Home") { v.tapKey(VncKeys.HOME) })
+        row.addView(key("End") { v.tapKey(VncKeys.END) })
+        row.addView(key("PgUp") { v.tapKey(VncKeys.PAGE_UP) })
+        row.addView(key("PgDn") { v.tapKey(VncKeys.PAGE_DOWN) })
+        row.addView(key("Del") { v.tapKey(VncKeys.DELETE) })
+        row.addView(key("Copy") { v.tapKey('c'.code, VncView.MOD_CTRL) })
+        row.addView(key("Paste") { v.tapKey('v'.code, VncView.MOD_CTRL) })
+        for (n in 1..12) row.addView(key("F$n") { v.tapKey(VncKeys.F1 + n - 1) })
+        refreshLatchButtons()
+        return HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            setBackgroundColor(0xFF252526.toInt())
+            addView(row)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        }
+    }
+
+    private fun refreshLatchButtons() {
+        val v = vncView
+        for ((mod, b) in latchButtons) {
+            val on = v != null && v.isLatched(mod)
+            (b.background as? GradientDrawable)?.setColor(if (on) ACCENT else 0xFF3C3C3C.toInt())
+        }
     }
 
     private fun runVerification() {
@@ -502,11 +859,24 @@ class MainActivity : AppCompatActivity(), ProvisionListener {
         buttonTintList = ColorStateList.valueOf(ACCENT)
     }
 
-    /** This screen's pixel size as a landscape size, rounded so the VNC server accepts it (width % 8, height % 2). */
+    private fun updateMode1OptionsVisibility() {
+        val v = if (modeGroup.checkedRadioButtonId == ID_MODE2) View.GONE else View.VISIBLE
+        qualityBox.visibility = v
+        viewerBox.visibility = v
+    }
+
+    /**
+     * The size of the area the Mode 1 desktop fills, as a landscape size, rounded so the VNC server accepts it
+     * (width % 8, height % 2). The app's real content area is used once the screen is laid out (it is smaller than the
+     * display by the status / navigation bars), so "Native" really is one desktop pixel per screen pixel.
+     */
     private fun nativeScreenSize(): Pair<Int, Int> {
         val dm = resources.displayMetrics
-        var w = maxOf(dm.widthPixels, dm.heightPixels)
-        var h = minOf(dm.widthPixels, dm.heightPixels)
+        val cw = contentRoot?.width ?: 0
+        val ch = contentRoot?.height ?: 0
+        val usable = cw > 0 && ch > 0
+        var w = maxOf(if (usable) cw else dm.widthPixels, if (usable) ch else dm.heightPixels)
+        var h = minOf(if (usable) cw else dm.widthPixels, if (usable) ch else dm.heightPixels)
         w = (w.coerceIn(800, 2560) / 8) * 8
         h = (h.coerceIn(500, 1600) / 2) * 2
         return w to h
@@ -516,6 +886,21 @@ class MainActivity : AppCompatActivity(), ProvisionListener {
         AppPrefs.QUALITY_BALANCED -> 1440 to 900
         AppPrefs.QUALITY_NATIVE -> nativeScreenSize()
         else -> 1920 to 1200
+    }
+
+    private fun runHousekeepingOnce() {
+        if (housekeepingDone) return
+        housekeepingDone = true
+        Thread({ prootManager.autoHousekeeping() }, "housekeeping").start()
+    }
+
+    private fun freeUpSpaceNow() {
+        statusText.text = "Cleaning up…"
+        Thread({
+            val freed = prootManager.freeUpSpace()
+            val text = if (freed >= 1024L * 1024) "Freed ${freed / (1024 * 1024)} MB." else "Nothing to free right now."
+            runOnUiThread { statusText.text = "$text Settings, extensions and projects were not touched." }
+        }, "free-up-space").start()
     }
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
@@ -668,7 +1053,8 @@ class MainActivity : AppCompatActivity(), ProvisionListener {
             orientation = RadioGroup.VERTICAL
             addView(qualityRadio(ID_Q_BALANCED, "Balanced · 1440×900\nlighter, text a little soft"))
             addView(qualityRadio(ID_Q_SHARP, "Sharp · 1920×1200\nclearer text"))
-            addView(qualityRadio(ID_Q_NATIVE, "Native · ${nativeW}×${nativeH}\nthis screen's own size: sharpest, heaviest"))
+            nativeQualityRadio = qualityRadio(ID_Q_NATIVE, "Native · ${nativeW}×${nativeH}\nthis screen's own size: sharpest, heaviest")
+            addView(nativeQualityRadio)
         }
         qualityGroup.check(
             when (prefs.mode1Quality) {
@@ -686,15 +1072,32 @@ class MainActivity : AppCompatActivity(), ProvisionListener {
         }
         qualityBox.addView(qualityGroup)
         readyColumn.addView(qualityBox)
-        // the quality only matters for Mode 1
-        modeGroup.setOnCheckedChangeListener { _, id ->
-            qualityBox.visibility = if (id == ID_MODE2) View.GONE else View.VISIBLE
+
+        viewerBox = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, dp(14), 0, 0)
         }
+        viewerBox.addView(makeText("Mode 1 viewer (used the next time Mode 1 starts):", 12f, MUTED))
+        viewerGroup = RadioGroup(this).apply {
+            orientation = RadioGroup.VERTICAL
+            addView(qualityRadio(ID_V_NATIVE, "Native viewer (recommended)\nfast, no browser, copy/paste works directly"))
+            addView(qualityRadio(ID_V_WEB, "Web viewer (noVNC)\nthe old browser-based screen, as a fallback"))
+        }
+        viewerGroup.check(if (prefs.mode1Viewer == AppPrefs.VIEWER_WEB) ID_V_WEB else ID_V_NATIVE)
+        viewerGroup.setOnCheckedChangeListener { _, id ->
+            prefs.mode1Viewer = if (id == ID_V_WEB) AppPrefs.VIEWER_WEB else AppPrefs.VIEWER_NATIVE
+        }
+        viewerBox.addView(viewerGroup)
+        readyColumn.addView(viewerBox)
+
+        // quality and viewer only matter for Mode 1
+        modeGroup.setOnCheckedChangeListener { _, _ -> updateMode1OptionsVisibility() }
 
         launchButton = makeButton("Launch VS Code", primary = true) { launchSelected() }
         readyColumn.addView(launchButton)
         verifyButton = makeButton("Verify installation (VS Code, Git, node-pty, extensions)", primary = false) { runVerification() }
         readyColumn.addView(verifyButton)
+        readyColumn.addView(makeButton("Free up space (old downloads, logs, caches)", primary = false) { freeUpSpaceNow() })
 
         statusText = makeText("", 13f, GREEN).apply { setPadding(0, dp(14), 0, dp(6)) }
         readyColumn.addView(statusText)
@@ -712,6 +1115,7 @@ class MainActivity : AppCompatActivity(), ProvisionListener {
             rootFrame.addView(v)
         }
         setContentView(rootFrame)
+        contentRoot = rootFrame
     }
 
     companion object {
@@ -720,10 +1124,72 @@ class MainActivity : AppCompatActivity(), ProvisionListener {
         private const val ID_Q_BALANCED = 1101
         private const val ID_Q_SHARP = 1102
         private const val ID_Q_NATIVE = 1103
+        private const val ID_V_NATIVE = 1201
+        private const val ID_V_WEB = 1202
         private const val BG = 0xFF1E1E1E.toInt()
         private const val ACCENT = 0xFF007ACC.toInt()
         private const val TEXT = 0xFFD4D4D4.toInt()
         private const val MUTED = 0xFF858585.toInt()
         private const val GREEN = 0xFF4EC9B0.toInt()
+
+        private const val MODE1_BASE_URL = "http://127.0.0.1:6080/vnc.html"
+        private const val MODE1_URL = "$MODE1_BASE_URL?autoconnect=true&resize=scale&quality=6&compression=2"
+        private const val MODE1_MAX_LOAD_ATTEMPTS = 40
+
+        /**
+         * Injected into the noVNC page once it has loaded. It uses noVNC's own clipboard text box (which exists in the
+         * page but stays hidden) so nothing in noVNC itself is modified:
+         *  - text copied in VS Code appears in that box -> it is handed to Android's clipboard;
+         *  - when the Android clipboard changes (or on Ctrl+V) its text is put in the box and noVNC sends it to the
+         *    desktop, so Ctrl+V in VS Code pastes it directly;
+         *  - if the connection to the desktop drops or the first connect fails, it presses noVNC's Connect button again.
+         * "lastSynced" is the text both sides currently share; it stops the two directions from echoing each other.
+         */
+        private const val CLIPBOARD_BRIDGE_JS = """
+(function () {
+  if (window.__pocketClipInstalled) { return; }
+  window.__pocketClipInstalled = true;
+  var lastSynced = null;
+  var syncedOnConnect = false;
+  var idleTicks = 0;
+  function box() { return document.getElementById('noVNC_clipboard_text'); }
+  function has(c) { return document.documentElement.classList.contains(c); }
+  function connected() { return has('noVNC_connected'); }
+  function busy() { return has('noVNC_connecting') || has('noVNC_connected') || has('noVNC_disconnecting') || has('noVNC_reconnecting'); }
+  function pushToDesktop(text) {
+    var t = box();
+    if (!t || !connected() || typeof text !== 'string' || text === '' || text === lastSynced) { return; }
+    lastSynced = text;
+    t.value = text;
+    t.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+  window.pocketSync = function () {
+    try { pushToDesktop(PocketClip.get()); } catch (e) {}
+  };
+  setInterval(function () {
+    try {
+      var t = box();
+      if (t && t.value && t.value !== lastSynced) {
+        lastSynced = t.value;
+        PocketClip.set(t.value);
+      }
+      if (connected()) {
+        if (!syncedOnConnect) { syncedOnConnect = true; window.pocketSync(); }
+      } else {
+        syncedOnConnect = false;
+      }
+      idleTicks = busy() ? 0 : idleTicks + 1;
+      if (idleTicks >= 3) {
+        idleTicks = 0;
+        var b = document.getElementById('noVNC_connect_button');
+        if (b) { b.click(); }
+      }
+    } catch (e) {}
+  }, 400);
+  window.addEventListener('keydown', function (e) {
+    if ((e.ctrlKey || e.metaKey) && (e.key === 'v' || e.key === 'V')) { window.pocketSync(); }
+  }, true);
+})();
+"""
     }
 }

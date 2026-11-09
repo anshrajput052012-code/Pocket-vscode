@@ -5,6 +5,7 @@ import org.apache.commons.compress.archivers.tar.TarArchiveEntry
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
 import org.apache.commons.compress.compressors.gzip.GzipCompressorInputStream
 import org.apache.commons.compress.compressors.xz.XZCompressorInputStream
+import org.apache.commons.compress.compressors.zstandard.ZstdCompressorInputStream
 import java.io.BufferedInputStream
 import java.io.File
 import java.io.FileOutputStream
@@ -255,7 +256,7 @@ class StandaloneProvisioner(
     private fun findAsset(prefix: String): String? =
         (context.assets.list("") ?: emptyArray()).firstOrNull { it.startsWith(prefix) }
 
-    /** Size of the asset as the app will read it (the original .tar.gz/.tar.xz file length). */
+    /** Size of the asset as the app will read it (the original .tar.zst/.tar.gz/.tar.xz file length). */
     private fun assetLength(name: String): Long {
         try {
             context.assets.openFd(name).use { return it.length }
@@ -346,7 +347,17 @@ class StandaloneProvisioner(
             header[2] == 'z'.code.toByte() && header[3] == 'X'.code.toByte() &&
             header[4] == 'Z'.code.toByte() && header[5] == 0x00.toByte()
 
+        // zstd frame magic number 0xFD2FB528, stored little-endian
+        val isZstd = n >= 4 && header[0] == 0x28.toByte() && header[1] == 0xB5.toByte() &&
+            header[2] == 0x2F.toByte() && header[3] == 0xFD.toByte()
+
         val decompressed: InputStream = when {
+            isZstd -> try {
+                ZstdCompressorInputStream(pushback)
+            } catch (e: Throwable) {
+                // missing or unloadable native decoder: say so plainly instead of a bare linkage error
+                throw IOException("The zstd decoder could not be started (${e.javaClass.simpleName}: ${e.message})")
+            }
             isXz -> XZCompressorInputStream(pushback)
             isGz -> GzipCompressorInputStream(pushback)
             else -> pushback

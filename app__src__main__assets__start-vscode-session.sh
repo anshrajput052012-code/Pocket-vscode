@@ -1,8 +1,9 @@
 #!/bin/bash
 # Pocket VS Code — session launcher (runs INSIDE the PRoot Debian ARM64 rootfs).
 #
-#   x11    : Mode 1 — Xtigervnc :1 (size chosen in the app, see GEOMETRY) + Openbox + noVNC + full Electron VS Code Desktop.
-#            Never throttled, no watcher.
+#   x11    : Mode 1 — Xtigervnc :1 (size chosen in the app, see GEOMETRY) + Openbox + full Electron VS Code Desktop.
+#            The app shows the desktop itself (native viewer, straight on port 5901); only when the "web" viewer is
+#            chosen (/root/.pocket-viewer) is noVNC (websockify on 6080) started as well. Never throttled, no watcher.
 #   direct : Mode 2 — official `code serve-web` on 127.0.0.1:8080 with the battery saver:
 #            the app refreshes /tmp/.pocket-mode2-heartbeat while a Mode 2 window is open; when it has not been
 #            refreshed for 10 minutes the server is hibernated with SIGTERM (0 % background drain). Re-opening
@@ -106,36 +107,45 @@ if [ -f /root/.pocket-geometry ]; then
     if printf '%s' "$CUSTOM" | grep -Eq '^[0-9]{3,4}x[0-9]{3,4}$'; then GEOMETRY="$CUSTOM"; fi
 fi
 
+# Which viewer the app uses: "native" (VncView, talks RFB on 5901 directly) or "web" (noVNC page via websockify on 6080).
+# Anything but an explicit "native" keeps the old behaviour.
+VIEWER="web"
+if [ -f /root/.pocket-viewer ] && [ "$(tr -d ' \r\n' < /root/.pocket-viewer)" = "native" ]; then VIEWER="native"; fi
+
 start_xserver() {
     pkill -9 -f Xtigervnc 2>/dev/null
     rm -rf /tmp/.X1-lock /tmp/.X11-unix/X1
     echo "[start-vscode] Starting Embedded X11 Server (Xtigervnc :1, $GEOMETRY)..."
-    # MIT-SHM is switched off on purpose: it needs SysV shared memory, which Android blocks, and clients such as
-    # Electron then die with "XIO: fatal IO error 38 (Function not implemented)". Without it they send their
-    # images through the socket instead.
-    Xtigervnc :1 \
-        -geometry "$GEOMETRY" \
-        -depth 24 \
-        -localhost \
-        -SecurityTypes None \
-        -AlwaysShared \
-        -extension MIT-SHM &
-    sleep 2
-    if ! pgrep -x Xtigervnc >/dev/null 2>&1; then
-        echo "[start-vscode] Xtigervnc did not start with MIT-SHM disabled - retrying with the defaults."
+    # Option sets, best first (the next one is only tried when the server did not come up):
+    #  - MIT-SHM is switched off on purpose: it needs SysV shared memory, which Android blocks, and clients such as
+    #    Electron then die with "XIO: fatal IO error 38 (Function not implemented)". Without it they send their
+    #    images through the socket instead.
+    #  - SendPrimary=0: only a real copy (Ctrl+C / Copy) is sent to the Android clipboard, not every text selection
+    #    (X's "primary selection"), so merely selecting text in VS Code no longer overwrites what was copied in Android.
+    local OPTS
+    #  - FrameRate=120: the server may push up to 120 pictures a second (default 60: a change could wait up to 16 ms for the
+    #    next slot, now at most about 8 ms), more than a 90 Hz tablet screen can show.
+    for OPTS in "-extension MIT-SHM -SendPrimary=0 -FrameRate=120" "-extension MIT-SHM -SendPrimary=0" "-extension MIT-SHM" ""; do
         rm -rf /tmp/.X1-lock /tmp/.X11-unix/X1
+        # shellcheck disable=SC2086  (the option set is meant to be split into words)
         Xtigervnc :1 \
             -geometry "$GEOMETRY" \
             -depth 24 \
             -localhost \
             -SecurityTypes None \
-            -AlwaysShared &
+            -AlwaysShared \
+            $OPTS &
         sleep 2
-    fi
+        if pgrep -x Xtigervnc >/dev/null 2>&1; then
+            return 0
+        fi
+        echo "[start-vscode] Xtigervnc did not start with options '${OPTS:-defaults}' - trying the next set."
+    done
+    return 1
 }
 
-# Keeps the virtual screen, the window manager and the noVNC bridge alive: if VS Code crashes, the page in the app
-# must not go away (that was the "Web page not available / ERR_CONNECTION_REFUSED" screen).
+# Keeps the virtual screen, the window manager (and, for the web viewer, the noVNC bridge) alive: if VS Code crashes,
+# the screen in the app must not go away (that was the "Web page not available / ERR_CONNECTION_REFUSED" screen).
 ensure_display() {
     if ! pgrep -x Xtigervnc >/dev/null 2>&1; then
         echo "[start-vscode] X server is not running - restarting it."
@@ -144,7 +154,7 @@ ensure_display() {
     if ! pgrep -x openbox >/dev/null 2>&1; then
         openbox &
     fi
-    if ! pgrep -f "websockify" >/dev/null 2>&1; then
+    if [ "$VIEWER" != "native" ] && ! pgrep -f "websockify" >/dev/null 2>&1; then
         websockify --web=/usr/share/novnc/ 127.0.0.1:6080 127.0.0.1:5901 &
         sleep 1
     fi
@@ -153,8 +163,26 @@ ensure_display() {
 export DISPLAY=:1
 start_xserver
 openbox &
-websockify --web=/usr/share/novnc/ 127.0.0.1:6080 127.0.0.1:5901 &
-sleep 1
+if [ "$VIEWER" != "native" ]; then
+    websockify --web=/usr/share/novnc/ 127.0.0.1:6080 127.0.0.1:5901 &
+fi
+
+# The app opens the screen as soon as it sees VSCODE_DISPLAY_READY. Say it only when the X server (5901) and, for the
+# web viewer, the noVNC web bridge (6080) really accept connections; a fixed "sleep 1" was sometimes too short on the
+# first launch and the app showed "Web page not available" until the next start.
+wait_port() {
+    local host="$1" port="$2" tries="$3" i=0
+    while [ "$i" -lt "$tries" ]; do
+        if (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null; then return 0; fi
+        sleep 0.5
+        i=$((i + 1))
+    done
+    return 1
+}
+wait_port 127.0.0.1 5901 40 || echo "[start-vscode] X server (port 5901) is not answering yet."
+if [ "$VIEWER" != "native" ]; then
+    wait_port 127.0.0.1 6080 40 || echo "[start-vscode] noVNC (port 6080) is not answering yet."
+fi
 
 echo "VSCODE_DISPLAY_READY"
 
