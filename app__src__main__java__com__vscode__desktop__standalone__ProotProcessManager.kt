@@ -494,10 +494,10 @@ class ProotProcessManager(context: Context) {
         return freed
     }
 
-    /** Quiet, automatic part: old Mode 2 server versions (a week old or more) and logs older than three days. */
+    /** Quiet, automatic part: old Mode 2 server versions (a day old or more, the newest stays) and logs older than three days. */
     fun autoHousekeeping() {
         try {
-            var freed = pruneOldServerVersions(7L * 24 * 3600 * 1000)
+            var freed = pruneOldServerVersions(24L * 3600 * 1000)
             val day = 24L * 3600 * 1000
             freed += deleteChildren(File(homeDir, ".config/Code/logs"), 3 * day)
             freed += deleteChildren(File(homeDir, ".vscode-server-data/data/logs"), 3 * day)
@@ -531,11 +531,91 @@ class ProotProcessManager(context: Context) {
                 }
             }
             freed += deleteChildren(context.cacheDir, 0L)
+            // package-manager download cache, trash and tool caches inside the Linux system (all rebuilt on demand)
+            freed += deleteTree(File(rootfsDir, "var/cache/apt"))
+            freed += deleteTree(File(homeDir, ".local/share/Trash"))
+            if (!Mode1Session.isAlive && !Mode2Server.isProcessAlive) freed += deleteChildren(File(homeDir, ".cache"), 0L)
+            // the Mode 2 web page's own caches (the page is fetched again from the local server)
+            if (!Mode2Server.isProcessAlive) {
+                val wv = File(context.applicationInfo.dataDir, "app_webview/Default")
+                for (n in listOf("Cache", "Code Cache", "GPUCache", "Service Worker/CacheStorage", "Service Worker/ScriptCache")) {
+                    freed += deleteTree(File(wv, n))
+                }
+            }
         } catch (e: Exception) {
             AppLog.add("Free up space: ${e.message}")
         }
         AppLog.add("Free up space: ${freed / (1024 * 1024)} MB freed.")
         return freed
+    }
+
+    /**
+     * "What is using the space": the app file, the Linux system's biggest folders (down to three levels) and the other
+     * app folders, largest first. Takes a few seconds (one walk over the files), so call it off the main thread.
+     */
+    fun storageReport(): List<String> {
+        val mb = 1024L * 1024
+        // what the file really occupies on the storage (whole 4 KB blocks), which is what Android's "app size" counts
+        fun onDisk(file: Path, attrs: BasicFileAttributes): Long = try {
+            android.system.Os.lstat(file.toString()).st_blocks * 512L
+        } catch (_: Throwable) {
+            attrs.size()
+        }
+        val sizes = HashMap<String, Long>()
+        var total = 0L
+        val rootPath = rootfsDir.toPath()
+        try {
+            Files.walkFileTree(rootPath, object : SimpleFileVisitor<Path>() {
+                override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
+                    if (attrs.isRegularFile) {
+                        val disk = onDisk(file, attrs)
+                        val rel = rootPath.relativize(file)
+                        val dirs = minOf(rel.nameCount - 1, 3)
+                        val key = StringBuilder()
+                        for (i in 0 until dirs) {
+                            key.append('/').append(rel.getName(i).toString())
+                            sizes[key.toString()] = (sizes[key.toString()] ?: 0L) + disk
+                        }
+                        total += disk
+                    }
+                    return FileVisitResult.CONTINUE
+                }
+
+                override fun visitFileFailed(file: Path, exc: IOException): FileVisitResult = FileVisitResult.CONTINUE
+            })
+        } catch (e: Exception) {
+            AppLog.add("Storage report: ${e.message}")
+        }
+
+        fun treeSize(dir: File): Long {
+            var n = 0L
+            if (!dir.exists()) return 0L
+            try {
+                Files.walkFileTree(dir.toPath(), object : SimpleFileVisitor<Path>() {
+                    override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
+                        if (attrs.isRegularFile) n += onDisk(file, attrs)
+                        return FileVisitResult.CONTINUE
+                    }
+
+                    override fun visitFileFailed(file: Path, exc: IOException): FileVisitResult = FileVisitResult.CONTINUE
+                })
+            } catch (_: Exception) {
+            }
+            return n
+        }
+
+        val out = ArrayList<String>()
+        val apk = File(context.applicationInfo.sourceDir).length()
+        val dataDir = File(context.applicationInfo.dataDir)
+        val otherFiles = treeSize(filesDir) - total
+        out.add("== Storage report ==")
+        out.add("App file (APK, cannot be reduced): ${apk / mb} MB")
+        out.add("Linux system + VS Code + your files, together: ${total / mb} MB")
+        out.add("Other app files: ${otherFiles / mb} MB · web page data: ${treeSize(File(dataDir, "app_webview")) / mb} MB · cache: ${treeSize(context.cacheDir) / mb} MB")
+        out.add("-- biggest folders inside the Linux system (MB on disk) --")
+        sizes.entries.filter { it.value >= 20 * mb }.sortedByDescending { it.value }.take(40)
+            .forEach { out.add(String.format("%6d  %s", it.value / mb, it.key)) }
+        return out
     }
 
     /** Mode 1: tells the start script whether the app shows the desktop itself (native: no noVNC / websockify needed). */

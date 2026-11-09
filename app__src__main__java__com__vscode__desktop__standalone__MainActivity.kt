@@ -894,6 +894,15 @@ class MainActivity : AppCompatActivity(), ProvisionListener {
         Thread({ prootManager.autoHousekeeping() }, "housekeeping").start()
     }
 
+    private fun storageReportNow() {
+        statusText.text = "Measuring the storage, this takes a few seconds…"
+        Thread({
+            val lines = prootManager.storageReport()
+            lines.forEach { AppLog.add(it) }
+            runOnUiThread { statusText.text = lines.drop(1).take(3).joinToString("\n") + "\n(the full list is in the log below)" }
+        }, "storage-report").start()
+    }
+
     private fun freeUpSpaceNow() {
         statusText.text = "Cleaning up…"
         Thread({
@@ -1098,6 +1107,7 @@ class MainActivity : AppCompatActivity(), ProvisionListener {
         verifyButton = makeButton("Verify installation (VS Code, Git, node-pty, extensions)", primary = false) { runVerification() }
         readyColumn.addView(verifyButton)
         readyColumn.addView(makeButton("Free up space (old downloads, logs, caches)", primary = false) { freeUpSpaceNow() })
+        readyColumn.addView(makeButton("Storage report (what uses the space)", primary = false) { storageReportNow() })
 
         statusText = makeText("", 13f, GREEN).apply { setPadding(0, dp(14), 0, dp(6)) }
         readyColumn.addView(statusText)

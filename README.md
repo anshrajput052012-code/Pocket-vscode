@@ -95,5 +95,6 @@ The CI build takes longer (qemu), the phone is much faster.
   unpacking is not slower than gzip. The app picks the format from the file's magic number (zstd / gzip / xz).
   Updating an installed app never re-extracts anything.
 * **Storage.** Old Mode 2 server downloads (`~/.vscode/cli/serve-web`, up to five versions of a few hundred MB, never used
-  again) are removed after a week, the newest is always kept; old logs go too. "Free up space" in the app does it at once
-  and also clears download/compiler caches. Mode 2 itself is unchanged.
+  again) are removed once they are a day old, the newest is always kept; old logs go too. "Free up space" in the app does it
+  at once and also clears download/compiler/web-page caches. "Storage report" lists the biggest folders (MB on disk) in the
+  log. Mode 2 itself is unchanged.
