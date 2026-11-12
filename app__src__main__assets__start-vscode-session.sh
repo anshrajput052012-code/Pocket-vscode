@@ -112,6 +112,38 @@ fi
 VIEWER="web"
 if [ -f /root/.pocket-viewer ] && [ "$(tr -d ' \r\n' < /root/.pocket-viewer)" = "native" ]; then VIEWER="native"; fi
 
+# "Fast cores only" (the app writes 1 or 0 to /root/.pocket-fastcores): the virtual screen and VS Code stay on the tablet's
+# big CPU cores instead of being moved to the slow little ones between key presses (less lag, a bit more battery). The big
+# cores are the ones whose maximum frequency is within 10 % of the highest; if that cannot be told, or fewer than two or all
+# of them qualify, or taskset does not work here, nothing is pinned and everything runs as before.
+PIN=()
+if [ -f /root/.pocket-fastcores ] && [ "$(tr -d ' \r\n' < /root/.pocket-fastcores)" = "1" ] && command -v taskset >/dev/null 2>&1; then
+    BIG_CPUS=""
+    MAXF=0
+    for f in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/cpuinfo_max_freq; do
+        [ -r "$f" ] || continue
+        v=$(cat "$f" 2>/dev/null) || continue
+        case "$v" in ''|*[!0-9]*) continue ;; esac
+        [ "$v" -gt "$MAXF" ] && MAXF=$v
+    done
+    if [ "$MAXF" -gt 0 ]; then
+        TOTAL=0
+        BIG=0
+        for f in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/cpuinfo_max_freq; do
+            [ -r "$f" ] || continue
+            v=$(cat "$f" 2>/dev/null) || continue
+            case "$v" in ''|*[!0-9]*) continue ;; esac
+            n="${f#/sys/devices/system/cpu/cpu}"; n="${n%%/*}"
+            TOTAL=$((TOTAL + 1))
+            if [ $((v * 100)) -ge $((MAXF * 90)) ]; then BIG_CPUS="${BIG_CPUS:+$BIG_CPUS,}$n"; BIG=$((BIG + 1)); fi
+        done
+        if [ "$BIG" -ge 2 ] && [ "$BIG" -lt "$TOTAL" ] && taskset -c "$BIG_CPUS" true 2>/dev/null; then
+            PIN=(taskset -c "$BIG_CPUS")
+            echo "[start-vscode] Fast cores only: CPUs $BIG_CPUS of $TOTAL."
+        fi
+    fi
+fi
+
 start_xserver() {
     pkill -9 -f Xtigervnc 2>/dev/null
     rm -rf /tmp/.X1-lock /tmp/.X11-unix/X1
@@ -128,7 +160,7 @@ start_xserver() {
     for OPTS in "-extension MIT-SHM -SendPrimary=0 -FrameRate=120" "-extension MIT-SHM -SendPrimary=0" "-extension MIT-SHM" ""; do
         rm -rf /tmp/.X1-lock /tmp/.X11-unix/X1
         # shellcheck disable=SC2086  (the option set is meant to be split into words)
-        Xtigervnc :1 \
+        "${PIN[@]}" Xtigervnc :1 \
             -geometry "$GEOMETRY" \
             -depth 24 \
             -localhost \
@@ -193,8 +225,9 @@ RC=0
 while true; do
     ensure_display
     STARTED=$(date +%s)
-    dbus-run-session -- /opt/vscode-arm64/bin/code \
+    "${PIN[@]}" dbus-run-session -- /opt/vscode-arm64/bin/code \
         --no-sandbox \
+        --disable-smooth-scrolling \
         --disable-gpu \
         --disable-gpu-sandbox \
         --disable-dev-shm-usage \

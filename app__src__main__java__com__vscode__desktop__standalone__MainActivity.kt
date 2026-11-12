@@ -31,6 +31,7 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
@@ -394,6 +395,7 @@ class MainActivity : AppCompatActivity(), ProvisionListener {
         val workspace = prefs.workspace ?: AppPrefs.defaultWorkspace()
         val nativeViewer = prefs.mode1Viewer == AppPrefs.VIEWER_NATIVE
         activeNativeViewer = nativeViewer
+        val fastCores = prefs.mode1FastCores
         // nothing of a previous session may stay on screen or keep connecting
         vncView?.stop()
         launchButton.isEnabled = false
@@ -415,6 +417,7 @@ class MainActivity : AppCompatActivity(), ProvisionListener {
                 prootManager.ensureSharedState()
                 prootManager.writeMode1Geometry(screenW, screenH)
                 prootManager.writeMode1Viewer(nativeViewer)
+                prootManager.writeMode1FastCores(fastCores)
                 val p = prootManager.startProotCommand(
                     command = "bash /root/start-vscode-session.sh x11",
                     workspaceHostPath = workspace,
@@ -1097,6 +1100,12 @@ class MainActivity : AppCompatActivity(), ProvisionListener {
             prefs.mode1Viewer = if (id == ID_V_WEB) AppPrefs.VIEWER_WEB else AppPrefs.VIEWER_NATIVE
         }
         viewerBox.addView(viewerGroup)
+        viewerBox.addView(CheckBox(this).apply {
+            text = "Fast cores only (smoother, uses a bit more battery)"
+            setTextColor(Color.WHITE)
+            isChecked = prefs.mode1FastCores
+            setOnCheckedChangeListener { _, on -> prefs.mode1FastCores = on }
+        })
         readyColumn.addView(viewerBox)
 
         // quality and viewer only matter for Mode 1

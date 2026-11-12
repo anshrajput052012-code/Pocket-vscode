@@ -98,3 +98,12 @@ The CI build takes longer (qemu), the phone is much faster.
   again) are removed once they are a day old, the newest is always kept; old logs go too. "Free up space" in the app does it
   at once and also clears download/compiler/web-page caches. "Storage report" lists the biggest folders (MB on disk) in the
   log. Mode 2 itself is unchanged.
+* **Shared files.** Mode 2's downloaded server and the VS Code desktop in /opt contain many identical files; they are
+  merged into hard links (same content and permissions only, atomic swap, never while VS Code runs) and the unused ~45 MB of
+  Electron translations are removed. The "Storage report" also lists the biggest single files.
+* **Less lag (Mode 1).** "Fast cores only" (Mode 1 options, on by default): on phones/tablets with clearly separate fast and
+  slow CPU cores the virtual screen and VS Code are pinned to the fast cores (`taskset`, chosen from `cpuinfo_max_freq`; if the
+  layout is unclear nothing is pinned). VS Code also starts with `--disable-smooth-scrolling`, which removes the scroll
+  animation that has to be sent as many frames. Mode 2 is not affected. Tips: "Balanced" quality sends fewer pixels; keep
+  big projects (node_modules, builds) in the Linux home (`/root/projects`) instead of `/root/Workspace` (that folder is the
+  Android shared storage, which is slow for thousands of small files).

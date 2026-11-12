@@ -17,6 +17,8 @@ import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.Path
 import java.nio.file.Paths
+import java.nio.file.StandardCopyOption
+import java.security.MessageDigest
 import java.nio.file.SimpleFileVisitor
 import java.nio.file.attribute.BasicFileAttributes
 import java.util.concurrent.TimeUnit
@@ -83,6 +85,13 @@ class AppPrefs(context: Context) {
         }
         set(value) {
             sp.edit().putString("mode1_viewer", value).apply()
+        }
+
+    /** Mode 1 runs on the big CPU cores only (faster and smoother, a little more battery). */
+    var mode1FastCores: Boolean
+        get() = sp.getBoolean("mode1_fast_cores", true)
+        set(value) {
+            sp.edit().putBoolean("mode1_fast_cores", value).apply()
         }
 
     /** The one-time gesture hint of the native viewer has been shown. */
@@ -503,6 +512,8 @@ class ProotProcessManager(context: Context) {
             freed += deleteChildren(File(homeDir, ".vscode-server-data/data/logs"), 3 * day)
             freed += deleteChildren(File(homeDir, ".config/Code/CachedExtensionVSIXs"), day)
             freed += deleteChildren(File(homeDir, ".npm/_logs"), 7 * day)
+            freed += trimElectronLocales()
+            freed += dedupeVsCodeFiles()
             if (freed > 0) AppLog.add("Cleanup: freed ${freed / (1024 * 1024)} MB of old leftovers.")
         } catch (e: Exception) {
             AppLog.add("Cleanup skipped: ${e.message}")
@@ -517,6 +528,8 @@ class ProotProcessManager(context: Context) {
         var freed = 0L
         try {
             freed += pruneOldServerVersions(0L)
+            freed += trimElectronLocales()
+            freed += dedupeVsCodeFiles()
             freed += deleteChildren(File(homeDir, ".config/Code/logs"), 0L)
             freed += deleteChildren(File(homeDir, ".config/Code/CachedExtensionVSIXs"), 0L)
             freed += deleteChildren(File(homeDir, ".config/Code/Crashpad"), 0L)
@@ -550,6 +563,125 @@ class ProotProcessManager(context: Context) {
     }
 
     /**
+     * Mode 2's downloaded server contains most of the same files as the VS Code desktop in /opt (same built-in
+     * extensions, same JavaScript for unchanged parts). Identical files (same content, same permissions) are replaced by
+     * hard links to one copy: nothing changes for the programs, the space is only used once. Never runs while VS Code is
+     * running; every file is swapped with an atomic rename. Returns the bytes saved.
+     */
+    fun dedupeVsCodeFiles(): Long {
+        if (Mode1Session.isAlive || Mode2Server.isProcessAlive || Mode2Server.externalSession) return 0L
+        if (!vscodeMarker.exists()) return 0L
+        val serveWeb = File(homeDir, ".vscode/cli/serve-web")
+        val hex = Regex("[0-9a-f]{40}")
+        val serverDirs = (serveWeb.listFiles() ?: emptyArray()).filter { it.isDirectory && hex.matches(it.name) }.sortedBy { it.name }
+        val signature = "v1;" + vscodeMarker.lastModified() + ";" + serverDirs.joinToString(",") { it.name + ":" + it.lastModified() }
+        val stateFile = File(homeDir, ".pocket-dedupe-state")
+        try {
+            if (stateFile.exists() && stateFile.readText() == signature) return 0L
+        } catch (_: Exception) {
+        }
+
+        class Item(val path: Path, val inode: Long, val mode: Int, val links: Long)
+
+        val bySize = HashMap<Long, MutableList<Item>>()
+        for (root in listOf(vscodeDir) + serverDirs) {
+            if (!root.exists()) continue
+            try {
+                Files.walkFileTree(root.toPath(), object : SimpleFileVisitor<Path>() {
+                    override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
+                        if (attrs.isRegularFile && attrs.size() >= 16 * 1024) {
+                            try {
+                                val st = android.system.Os.lstat(file.toString())
+                                bySize.getOrPut(attrs.size()) { ArrayList() }.add(Item(file, st.st_ino, st.st_mode and 4095, st.st_nlink))
+                            } catch (_: Throwable) {
+                            }
+                        }
+                        return FileVisitResult.CONTINUE
+                    }
+
+                    override fun visitFileFailed(file: Path, exc: IOException): FileVisitResult = FileVisitResult.CONTINUE
+                })
+            } catch (_: Exception) {
+            }
+        }
+
+        fun sha256(path: Path): String? = try {
+            val md = MessageDigest.getInstance("SHA-256")
+            Files.newInputStream(path).use { input ->
+                val buf = ByteArray(64 * 1024)
+                while (true) {
+                    val n = input.read(buf)
+                    if (n < 0) break
+                    md.update(buf, 0, n)
+                }
+            }
+            md.digest().joinToString("") { String.format("%02x", it) }
+        } catch (_: Exception) {
+            null
+        }
+
+        var saved = 0L
+        var failures = 0
+        var linked = 0
+        outer@ for ((size, items) in bySize) {
+            if (items.size < 2 || items.map { it.inode }.toSet().size < 2) continue
+            val groups = HashMap<String, MutableList<Item>>()
+            for (item in items) {
+                val h = sha256(item.path) ?: continue
+                groups.getOrPut(h + "/" + item.mode) { ArrayList() }.add(item)
+            }
+            for (g in groups.values) {
+                if (g.size < 2) continue
+                val keeper = g[0]
+                for (other in g.drop(1)) {
+                    if (other.inode == keeper.inode) continue
+                    val tmp = other.path.resolveSibling(other.path.fileName.toString() + ".pocket-link")
+                    try {
+                        Files.deleteIfExists(tmp)
+                        Files.createLink(tmp, keeper.path)
+                        Files.move(tmp, other.path, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+                        if (other.links <= 1L) saved += size
+                        linked++
+                    } catch (_: Exception) {
+                        try {
+                            Files.deleteIfExists(tmp)
+                        } catch (_: Exception) {
+                        }
+                        failures++
+                        if (linked == 0 && failures >= 5) break@outer // hard links are not allowed here: stop trying
+                    }
+                }
+            }
+        }
+        try {
+            stateFile.writeText(signature)
+        } catch (_: Exception) {
+        }
+        if (saved > 0) AppLog.add("Cleanup: identical VS Code files now share space ($linked files, ${saved / (1024 * 1024)} MB saved).")
+        return saved
+    }
+
+    /** VS Code (Electron) falls back to en-US when a language file is missing: the other ~45 MB of translations are not needed. */
+    fun trimElectronLocales(): Long {
+        val dir = File(vscodeDir, "locales")
+        val marker = File(vscodeDir, ".pocket-locales-trimmed")
+        if (marker.exists() || !File(dir, "en-US.pak").exists()) return 0L
+        var freed = 0L
+        for (f in dir.listFiles() ?: emptyArray()) {
+            if (f.isFile && f.name.endsWith(".pak") && f.name != "en-US.pak") {
+                val len = f.length()
+                if (f.delete()) freed += len
+            }
+        }
+        try {
+            marker.writeText("1\n")
+        } catch (_: Exception) {
+        }
+        if (freed > 0) AppLog.add("Cleanup: removed unused Electron translations (${freed / (1024 * 1024)} MB).")
+        return freed
+    }
+
+    /**
      * "What is using the space": the app file, the Linux system's biggest folders (down to three levels) and the other
      * app folders, largest first. Takes a few seconds (one walk over the files), so call it off the main thread.
      */
@@ -562,6 +694,7 @@ class ProotProcessManager(context: Context) {
             attrs.size()
         }
         val sizes = HashMap<String, Long>()
+        val bigFiles = ArrayList<Pair<Long, String>>()
         var total = 0L
         val rootPath = rootfsDir.toPath()
         try {
@@ -570,7 +703,15 @@ class ProotProcessManager(context: Context) {
                     if (attrs.isRegularFile) {
                         val disk = onDisk(file, attrs)
                         val rel = rootPath.relativize(file)
-                        val dirs = minOf(rel.nameCount - 1, 3)
+                        val top = rel.getName(0).toString()
+                        val dirs = minOf(rel.nameCount - 1, if (top == "opt" || top == "root") 5 else 3)
+                        if (disk >= 8 * mb) {
+                            bigFiles.add(disk to "/" + rel.toString())
+                            if (bigFiles.size > 400) {
+                                bigFiles.sortByDescending { it.first }
+                                while (bigFiles.size > 40) bigFiles.removeAt(bigFiles.size - 1)
+                            }
+                        }
                         val key = StringBuilder()
                         for (i in 0 until dirs) {
                             key.append('/').append(rel.getName(i).toString())
@@ -613,9 +754,21 @@ class ProotProcessManager(context: Context) {
         out.add("Linux system + VS Code + your files, together: ${total / mb} MB")
         out.add("Other app files: ${otherFiles / mb} MB · web page data: ${treeSize(File(dataDir, "app_webview")) / mb} MB · cache: ${treeSize(context.cacheDir) / mb} MB")
         out.add("-- biggest folders inside the Linux system (MB on disk) --")
-        sizes.entries.filter { it.value >= 20 * mb }.sortedByDescending { it.value }.take(40)
+        sizes.entries.filter { it.value >= 20 * mb }.sortedByDescending { it.value }.take(60)
             .forEach { out.add(String.format("%6d  %s", it.value / mb, it.key)) }
+        out.add("-- biggest single files (MB) --")
+        bigFiles.sortedByDescending { it.first }.take(30).forEach { out.add(String.format("%6d  %s", it.first / mb, it.second)) }
         return out
+    }
+
+    /** Mode 1: tells the start script whether to keep the desktop on the big CPU cores. */
+    fun writeMode1FastCores(on: Boolean) {
+        try {
+            homeDir.mkdirs()
+            File(homeDir, ".pocket-fastcores").writeText(if (on) "1\n" else "0\n")
+        } catch (e: Exception) {
+            AppLog.add("Warning: could not store the fast-cores choice: ${e.message}")
+        }
     }
 
     /** Mode 1: tells the start script whether the app shows the desktop itself (native: no noVNC / websockify needed). */
