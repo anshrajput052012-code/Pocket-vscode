@@ -415,6 +415,7 @@ class MainActivity : AppCompatActivity(), ProvisionListener {
             try {
                 Mode1Session.stop()
                 prootManager.ensureSharedState()
+                prootManager.ensureMode1Settings()
                 prootManager.writeMode1Geometry(screenW, screenH)
                 prootManager.writeMode1Viewer(nativeViewer)
                 prootManager.writeMode1FastCores(fastCores)

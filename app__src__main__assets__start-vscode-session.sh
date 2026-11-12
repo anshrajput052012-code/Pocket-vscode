@@ -218,6 +218,41 @@ fi
 
 echo "VSCODE_DISPLAY_READY"
 
+# True while the Electron main process of VS Code is running. The helper processes carry --type=..., and the small
+# "code cli.js" launcher that `code --wait` starts is not VS Code itself.
+VSC_MAIN="${POCKET_VSC_MAIN:-/opt/vscode-arm64/code}"
+vscode_main_alive() {
+    local pid cmd
+    for pid in $(pgrep -f "^${VSC_MAIN}( |\$)" 2>/dev/null); do
+        cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null) || continue
+        case "$cmd" in
+            *" --type="*|*"cli.js"*) ;;
+            *) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# Where the last session stopped: VS Code records its active window in storage.json. Starting on that folder brings back
+# its tabs, cursor positions and unsaved edits (they are kept per folder). On the first start, or when that folder is
+# gone, the project folder is opened.
+pick_open_path() {
+    local state="/root/.config/Code/User/globalStorage/storage.json" line p
+    if [ -f "$state" ]; then
+        line=$(grep -A12 '"lastActiveWindow"' "$state" 2>/dev/null | grep -o '"folder"[[:space:]]*:[[:space:]]*"file://[^"]*"' | head -n 1)
+        p="${line#*file://}"
+        p="${p%\"}"
+        if [ -n "$line" ] && [ -n "$p" ]; then
+            p=$(printf '%b' "${p//%/\\x}")
+            if [ -d "$p" ]; then
+                printf '%s' "$p"
+                return 0
+            fi
+        fi
+    fi
+    printf '%s' "/root/Workspace"
+}
+
 # If VS Code crashes (exit code != 0) it is started again and reopens the previous windows; closing it normally
 # (exit code 0) ends the session. Ten quick crashes in a row stop the loop.
 RESTARTS=0
@@ -225,6 +260,8 @@ RC=0
 while true; do
     ensure_display
     STARTED=$(date +%s)
+    OPEN_PATH=$(pick_open_path)
+    echo "[start-vscode] Opening $OPEN_PATH"
     "${PIN[@]}" dbus-run-session -- /opt/vscode-arm64/bin/code \
         --no-sandbox \
         --disable-smooth-scrolling \
@@ -235,8 +272,17 @@ while true; do
         --user-data-dir="/root/.config/Code" \
         --extensions-dir="/root/.vscode/extensions" \
         --wait \
-        "/root/Workspace"
+        "$OPEN_PATH"
     RC=$?
+    # `code --wait` also returns (with 0) when the window is switched to another folder (File > Open Folder, Open
+    # Recent, ...) while VS Code itself keeps running. That must not end the session: wait until VS Code really quits.
+    if [ "$RC" -eq 0 ]; then
+        for _i in 1 2 3; do vscode_main_alive && break; sleep 1; done
+        if vscode_main_alive; then
+            echo "[start-vscode] The launcher returned but VS Code is still running (folder switched) - keeping the session."
+            while vscode_main_alive; do sleep 1; done
+        fi
+    fi
     echo "[start-vscode] VS Code exited with code $RC (signal $((RC > 128 ? RC - 128 : 0)))"
     if [ "$RC" -eq 0 ]; then break; fi
     if [ $(( $(date +%s) - STARTED )) -ge 120 ]; then RESTARTS=0; fi

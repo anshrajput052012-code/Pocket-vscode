@@ -107,3 +107,21 @@ The CI build takes longer (qemu), the phone is much faster.
   animation that has to be sent as many frames. Mode 2 is not affected. Tips: "Balanced" quality sends fewer pixels; keep
   big projects (node_modules, builds) in the Linux home (`/root/projects`) instead of `/root/Workspace` (that folder is the
   Android shared storage, which is slow for thousands of small files).
+* **Switching folders in Mode 1.** VS Code is started with `code --wait`, and that launcher also returns (exit code 0) when the
+  window is switched to another folder (File > Open Folder, Open Recent, ...). The start script used to take that for "VS Code
+  was closed" and ended the whole session, which looked like a crash. It now keeps the session while the Electron main process
+  (`/opt/vscode-arm64/code`, not its `--type=` helpers or the `cli.js` launcher) is still running, and ends it only when VS Code
+  really quits.
+* **Clipboard in Mode 2 (online).** A WebView shows no permission prompt for `navigator.clipboard`, so the workbench's own
+  Paste (Edit menu, editor context menu, terminal) was always refused. `WorkbenchActivity` now installs an origin-restricted
+  message channel (`WebViewCompat.addWebMessageListener`, only for `http://127.0.0.1:8080`) plus a document-start script that
+  routes `navigator.clipboard.readText / writeText / read / write` and the clipboard permission query to the Android
+  clipboard. Keyboard paste and the long-press paste menu are untouched; on a WebView too old for these features the bridge is
+  skipped (logged) and nothing changes.
+* **Continue where you left off.** Auto-save (0.5 s), hot exit (unsaved edits are kept as backups) and window restore are now
+  also written to the desktop's settings file before Mode 1 starts (Mode 2 already did this; the file is shared). Mode 1 starts
+  on the folder VS Code had open last (read from `globalStorage/storage.json`; first start or a deleted folder: the project
+  folder), so its tabs, cursor positions and unsaved edits return with it. Mode 2 remembers the last
+  `?folder=` / `?workspace=` of the workbench (kept in the app's preferences, checked for existence) and loads it instead of
+  always `/root/Workspace`; when the screen is left the page keeps running for 8 more seconds so it can write its latest editor
+  state before it is paused or destroyed.

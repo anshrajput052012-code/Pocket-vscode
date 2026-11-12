@@ -94,6 +94,13 @@ class AppPrefs(context: Context) {
             sp.edit().putBoolean("mode1_fast_cores", value).apply()
         }
 
+    /** Mode 2: the folder the workbench showed when it was left (reopened there next time). */
+    var mode2LastUrl: String?
+        get() = sp.getString("mode2_last_url", null)
+        set(value) {
+            sp.edit().putString("mode2_last_url", value).apply()
+        }
+
     /** The one-time gesture hint of the native viewer has been shown. */
     var shownNativeHint: Boolean
         get() = sp.getBoolean("shown_native_hint", false)
@@ -807,6 +814,20 @@ class ProotProcessManager(context: Context) {
             } catch (e: Exception) {
                 AppLog.add("Warning: could not write Mode 2 $sub settings: ${e.message}")
             }
+        }
+    }
+
+    /**
+     * Mode 1: the same 0.5 s auto-save, hot exit and window restore as Mode 2. The desktop's settings file is the one
+     * Mode 2 shares (see [ensureSharedState]), so it already carries them once Mode 2 has run; this makes a Mode 1-only
+     * installation behave the same. Call it while VS Code is not running.
+     */
+    fun ensureMode1Settings() {
+        try {
+            val dir = File(homeDir, ".config/Code/User").apply { mkdirs() }
+            mergeMode2Settings(File(dir, "settings.json"))
+        } catch (e: Exception) {
+            AppLog.add("Warning: could not write the Mode 1 settings: ${e.message}")
         }
     }
 

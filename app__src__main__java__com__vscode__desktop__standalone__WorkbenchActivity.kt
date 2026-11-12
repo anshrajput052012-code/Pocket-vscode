@@ -33,6 +33,13 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AppCompatActivity
+import androidx.webkit.WebViewCompat
+import androidx.webkit.WebViewFeature
+import org.json.JSONObject
+import java.io.File
+import java.nio.file.Files
+import java.nio.file.LinkOption
+import java.nio.file.Paths
 
 /**
  * Full-screen host for Mode 2 (`code serve-web`).
@@ -121,6 +128,8 @@ class WorkbenchActivity : AppCompatActivity() {
         s.cacheMode = WebSettings.LOAD_DEFAULT
         CookieManager.getInstance().setAcceptCookie(true)
 
+        installClipboardBridge(wv)
+
         wv.webChromeClient = WebChromeClient()
         wv.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
@@ -137,6 +146,11 @@ class WorkbenchActivity : AppCompatActivity() {
 
             override fun onPageFinished(view: WebView?, url: String?) {
                 loadRetries = 0
+                rememberWorkbenchUrl(url)
+            }
+
+            override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
+                rememberWorkbenchUrl(url)
             }
 
             override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
@@ -161,6 +175,123 @@ class WorkbenchActivity : AppCompatActivity() {
     }
 
     // ---------------------------------------------------------------------------------------------
+    // Continue where you left off: the workbench reopens on the folder it showed last (its tabs, cursor positions and
+    // unsaved edits live in the page's own storage and come back with the folder).
+    // ---------------------------------------------------------------------------------------------
+
+    /** Reduces a workbench address to http://127.0.0.1:8080/?folder=… (or ?workspace=…); null for anything else. */
+    private fun canonicalWorkbenchUrl(raw: String?): String? {
+        if (raw.isNullOrEmpty()) return null
+        return try {
+            val u = Uri.parse(raw)
+            if (u.host != "127.0.0.1" || u.port != Mode2Server.PORT) return null
+            val key = when {
+                !u.getQueryParameter("folder").isNullOrEmpty() -> "folder"
+                !u.getQueryParameter("workspace").isNullOrEmpty() -> "workspace"
+                else -> return null
+            }
+            Uri.Builder()
+                .scheme("http")
+                .encodedAuthority("127.0.0.1:${Mode2Server.PORT}")
+                .path("/")
+                .appendQueryParameter(key, u.getQueryParameter(key))
+                .build()
+                .toString()
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun rememberWorkbenchUrl(raw: String?) {
+        val url = canonicalWorkbenchUrl(raw) ?: return
+        if (url != prefs.mode2LastUrl) prefs.mode2LastUrl = url
+    }
+
+    /** The folder as the Linux system sees it, checked on the phone's side. True when unsure. */
+    private fun guestPathExists(path: String): Boolean {
+        return try {
+            val host = if (path == WORKSPACE_GUEST || path.startsWith("$WORKSPACE_GUEST/")) {
+                File(prefs.workspace ?: AppPrefs.defaultWorkspace(), path.removePrefix(WORKSPACE_GUEST).trimStart('/'))
+            } else {
+                File(prootManager.rootfsDir, path.trimStart('/'))
+            }
+            Files.exists(Paths.get(host.path), LinkOption.NOFOLLOW_LINKS)
+        } catch (_: Exception) {
+            true
+        }
+    }
+
+    /** The remembered folder (if it still exists), otherwise the project folder. */
+    private fun startUrl(): String {
+        val saved = prefs.mode2LastUrl ?: return Mode2Server.URL
+        val folder = Uri.parse(saved).getQueryParameter("folder")
+        if (folder != null && folder.startsWith("/") && !guestPathExists(folder)) return Mode2Server.URL
+        return saved
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Clipboard bridge (Paste / Copy in the workbench's menus, command palette and terminal)
+    // ---------------------------------------------------------------------------------------------
+
+    /**
+     * A WebView has no permission prompt for `navigator.clipboard`, so the workbench's own Paste (menu, context menu,
+     * terminal) was always refused and there was nowhere to allow it. This gives the page of the local server (and
+     * only that origin) the Android clipboard through a message channel: readText / writeText / read / write.
+     * Keyboard paste and the long-press paste menu of the WebView keep working as before.
+     */
+    private fun installClipboardBridge(wv: WebView) {
+        try {
+            if (!WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER) ||
+                !WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)
+            ) {
+                AppLog.add("[mode2] This WebView cannot bridge the clipboard (update Android System WebView).")
+                return
+            }
+            val page = Uri.parse(Mode2Server.URL)
+            val origins = setOf("${page.scheme}://${page.host}:${page.port}")
+            WebViewCompat.addWebMessageListener(wv, "pocketClipboard", origins) { _, message, _, _, reply ->
+                handleClipboardMessage(message.data) { answer -> reply.postMessage(answer) }
+            }
+            WebViewCompat.addDocumentStartJavaScript(wv, CLIPBOARD_BRIDGE_JS, origins)
+        } catch (e: Throwable) {
+            AppLog.add("[mode2] Clipboard bridge not installed: ${e.message}")
+        }
+    }
+
+    private fun handleClipboardMessage(raw: String?, reply: (String) -> Unit) {
+        if (raw == null) return
+        var id = 0
+        try {
+            val request = JSONObject(raw)
+            id = request.optInt("id")
+            val answer = JSONObject().put("id", id)
+            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            when (request.optString("op")) {
+                "read" -> {
+                    val clip = cm.primaryClip
+                    val text = if (clip != null && clip.itemCount > 0) {
+                        clip.getItemAt(0).coerceToText(this)?.toString() ?: ""
+                    } else {
+                        ""
+                    }
+                    answer.put("ok", true).put("text", text)
+                }
+                "write" -> {
+                    cm.setPrimaryClip(ClipData.newPlainText("VS Code", request.optString("text")))
+                    answer.put("ok", true).put("text", "")
+                }
+                else -> answer.put("ok", false)
+            }
+            reply(answer.toString())
+        } catch (e: Exception) {
+            try {
+                reply(JSONObject().put("id", id).put("ok", false).toString())
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------
     // Lifecycle
     // ---------------------------------------------------------------------------------------------
 
@@ -175,18 +306,23 @@ class WorkbenchActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        ui.removeCallbacks(pauseRunnable)
         webView?.onResume()
         Mode2Server.touchHeartbeat(prootManager)
     }
 
+    private val pauseRunnable = Runnable { webView?.onPause() }
+
     override fun onPause() {
-        // Mode 2 battery saver: freeze the page's JS/timers while the app is not in front.
-        webView?.onPause()
+        // Mode 2 battery saver: freeze the page's JS/timers while the app is not in front - after a short grace period,
+        // so the workbench can still write its latest editor state (it saves it every few seconds).
+        ui.postDelayed(pauseRunnable, PAUSE_GRACE_MS)
         super.onPause()
     }
 
     override fun onStop() {
         Mode2Server.foreground = false
+        rememberWorkbenchUrl(webView?.url)
         try {
             CookieManager.getInstance().flush()
         } catch (_: Exception) {
@@ -197,9 +333,15 @@ class WorkbenchActivity : AppCompatActivity() {
     override fun onDestroy() {
         destroyed = true
         ui.removeCallbacksAndMessages(null)
-        webView?.let {
-            root.removeView(it)
-            it.destroy()
+        webView?.let { wv ->
+            root.removeView(wv)
+            // keep the page alive for a few more seconds so that its last editor state is written before it is torn down
+            Handler(Looper.getMainLooper()).postDelayed({
+                try {
+                    wv.destroy()
+                } catch (_: Throwable) {
+                }
+            }, PAUSE_GRACE_MS)
         }
         webView = null
         super.onDestroy()
@@ -263,7 +405,7 @@ class WorkbenchActivity : AppCompatActivity() {
         if (loadedEpoch != Mode2Server.epoch) {
             loadedEpoch = Mode2Server.epoch
             loadRetries = 0
-            wv.loadUrl(Mode2Server.URL)
+            wv.loadUrl(startUrl())
         }
     }
 
@@ -384,8 +526,100 @@ class WorkbenchActivity : AppCompatActivity() {
     }
 
     companion object {
+        /**
+         * Runs at document start in the workbench page: replaces navigator.clipboard (read/write text) and the
+         * clipboard permission query by calls over the "pocketClipboard" message channel. If the channel is missing
+         * the page keeps the browser's own behaviour.
+         */
+        private const val CLIPBOARD_BRIDGE_JS = """
+(function () {
+  try {
+    var port = window.pocketClipboard;
+    if (!port || !window.navigator || window.__pocketClipboardBridge) return;
+    window.__pocketClipboardBridge = true;
+    var orig = navigator.clipboard;
+    var pending = {};
+    var seq = 0;
+    function denied() {
+      try { return new DOMException('Clipboard is not available', 'NotAllowedError'); }
+      catch (e) { return new Error('Clipboard is not available'); }
+    }
+    port.onmessage = function (ev) {
+      try {
+        var m = JSON.parse(ev.data);
+        var p = pending[m.id];
+        if (!p) return;
+        delete pending[m.id];
+        clearTimeout(p.t);
+        if (m.ok) p.res(m.text || ''); else p.rej(denied());
+      } catch (e) {}
+    };
+    function call(op, text) {
+      return new Promise(function (res, rej) {
+        var id = ++seq;
+        var t = setTimeout(function () {
+          if (pending[id]) { delete pending[id]; rej(denied()); }
+        }, 8000);
+        pending[id] = { res: res, rej: rej, t: t };
+        try {
+          port.postMessage(JSON.stringify({ id: id, op: op, text: text === undefined ? '' : text }));
+        } catch (e) {
+          clearTimeout(t); delete pending[id]; rej(denied());
+        }
+      });
+    }
+    function viaOriginal(name, args) {
+      if (orig && typeof orig[name] === 'function') return orig[name].apply(orig, args);
+      return Promise.reject(denied());
+    }
+    var clip = {
+      readText: function () { return call('read'); },
+      writeText: function (t) { return call('write', String(t)).then(function () {}); },
+      read: function () {
+        if (typeof ClipboardItem !== 'function') return viaOriginal('read', arguments);
+        return call('read').then(function (t) {
+          return [new ClipboardItem({ 'text/plain': new Blob([t], { type: 'text/plain' }) })];
+        });
+      },
+      write: function (items) {
+        try {
+          var it = items && items[0];
+          if (it && it.types && it.types.indexOf('text/plain') >= 0) {
+            return it.getType('text/plain')
+              .then(function (b) { return b.text(); })
+              .then(function (t) { return call('write', t); })
+              .then(function () {});
+          }
+        } catch (e) {}
+        return viaOriginal('write', arguments);
+      },
+      addEventListener: function () {},
+      removeEventListener: function () {},
+      dispatchEvent: function () { return false; }
+    };
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true, enumerable: true, get: function () { return clip; }
+    });
+    if (navigator.permissions && typeof navigator.permissions.query === 'function') {
+      var origQuery = navigator.permissions.query.bind(navigator.permissions);
+      navigator.permissions.query = function (d) {
+        if (d && (d.name === 'clipboard-read' || d.name === 'clipboard-write')) {
+          return Promise.resolve({
+            name: d.name, state: 'granted', onchange: null,
+            addEventListener: function () {}, removeEventListener: function () {}
+          });
+        }
+        return origQuery(d);
+      };
+    }
+  } catch (e) {}
+})();
+"""
+
         private const val BG = 0xFF1E1E1E.toInt()
         private const val START_TIMEOUT_MS = 180_000L
         private const val MAX_LOAD_RETRIES = 6
+        private const val PAUSE_GRACE_MS = 8_000L
+        private const val WORKSPACE_GUEST = "/root/Workspace"
     }
 }
