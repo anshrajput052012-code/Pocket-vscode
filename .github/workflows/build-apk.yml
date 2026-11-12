@@ -22,7 +22,8 @@ env:
 
 jobs:
   build-arm64-apk:
-    runs-on: ubuntu-latest
+    # Pinned: "ubuntu-latest" moved to Ubuntu 26.04 (Oct-Nov 2026), which has no qemu-user-static package any more.
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
       - name: Checkout Project Source
@@ -237,7 +238,9 @@ jobs:
 
           # arm64 emulation on the x86 runner (qemu-user via binfmt_misc, registered with the "fix binary" flag).
           sudo apt-get update -qq
-          sudo apt-get install -y qemu-user-static binfmt-support pigz
+          sudo apt-get install -y pigz binfmt-support || sudo apt-get install -y pigz
+          # Ubuntu 26.04 and newer renamed qemu-user-static to qemu-user-binfmt
+          sudo apt-get install -y qemu-user-static || sudo apt-get install -y qemu-user-binfmt || sudo apt-get install -y qemu-user
           # newer qemu than the distro package (re-registers the arm64 handler); harmless if docker is unavailable
           docker run --privileged --rm tonistiigi/binfmt --install arm64 >/dev/null 2>&1 || true
 
@@ -259,7 +262,9 @@ jobs:
           # Is arm64 emulation working?  (fallback: copy the apt qemu binary into the chroot)
           if ! sudo chroot "$R" /bin/sh -c 'uname -m' 2>/dev/null | grep -q aarch64; then
             echo "binfmt not active for the chroot - copying qemu-aarch64-static into the rootfs"
-            sudo cp /usr/bin/qemu-aarch64-static "$R/usr/bin/"
+            QEMU_BIN=$(command -v qemu-aarch64-static || command -v qemu-aarch64 || true)
+            [ -n "$QEMU_BIN" ] || { echo "::error::no qemu-aarch64 binary found on this runner"; exit 1; }
+            sudo cp "$QEMU_BIN" "$R/usr/bin/qemu-aarch64-static"
             sudo update-binfmts --enable qemu-aarch64 || true
           fi
           sudo chroot "$R" /bin/sh -c 'uname -m' | grep -q aarch64 || { echo "::error::arm64 emulation is not working on this runner"; exit 1; }
