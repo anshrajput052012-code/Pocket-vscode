@@ -520,11 +520,36 @@ class ProotProcessManager(context: Context) {
             freed += deleteChildren(File(homeDir, ".config/Code/CachedExtensionVSIXs"), day)
             freed += deleteChildren(File(homeDir, ".npm/_logs"), 7 * day)
             freed += trimElectronLocales()
+            freed += removeAntigravityLeftovers()
             freed += dedupeVsCodeFiles()
             if (freed > 0) AppLog.add("Cleanup: freed ${freed / (1024 * 1024)} MB of old leftovers.")
         } catch (e: Exception) {
             AppLog.add("Cleanup skipped: ${e.message}")
         }
+    }
+
+    /**
+     * An earlier test build had a Mode 3 for the Antigravity IDE; it is gone from the app. Whatever it left in the Linux
+     * system (the program, a half-finished download, its data) is deleted here so that the storage comes back. Returns the
+     * bytes freed.
+     */
+    private fun removeAntigravityLeftovers(): Long {
+        var freed = 0L
+        val dirs = listOf(
+            File(rootfsDir, "opt/antigravity"),
+            File(rootfsDir, "opt/antigravity.new"),
+            File(homeDir, ".config/Antigravity"),
+            File(homeDir, ".antigravity")
+        )
+        for (dir in dirs) {
+            if (dir.exists()) freed += deleteTree(dir)
+        }
+        val download = File(tmpDir, "antigravity-ide.tar.gz")
+        if (download.exists()) {
+            val size = download.length()
+            if (download.delete()) freed += size
+        }
+        return freed
     }
 
     /**
@@ -536,6 +561,7 @@ class ProotProcessManager(context: Context) {
         try {
             freed += pruneOldServerVersions(0L)
             freed += trimElectronLocales()
+            freed += removeAntigravityLeftovers()
             freed += dedupeVsCodeFiles()
             freed += deleteChildren(File(homeDir, ".config/Code/logs"), 0L)
             freed += deleteChildren(File(homeDir, ".config/Code/CachedExtensionVSIXs"), 0L)
@@ -814,16 +840,6 @@ class ProotProcessManager(context: Context) {
             } catch (e: Exception) {
                 AppLog.add("Warning: could not write Mode 2 $sub settings: ${e.message}")
             }
-        }
-    }
-
-    /** Mode 3: the same auto-save / hot exit / window restore in Antigravity's own settings. Call it while it is not running. */
-    fun ensureAntigravitySettings() {
-        try {
-            val dir = File(homeDir, ".config/Antigravity/User").apply { mkdirs() }
-            mergeMode2Settings(File(dir, "settings.json"))
-        } catch (e: Exception) {
-            AppLog.add("Warning: could not write the Antigravity settings: ${e.message}")
         }
     }
 

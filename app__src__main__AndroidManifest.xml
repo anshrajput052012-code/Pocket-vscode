@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    xmlns:tools="http://schemas.android.com/tools">
+    xmlns:tools="http://schemas.android.com/tools"
+    android:installLocation="auto">
 
     <!-- Network access for apt (first-run environment setup), the Mode 2 web server download, extensions and Git -->
     <uses-permission android:name="android.permission.INTERNET" />

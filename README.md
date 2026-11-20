@@ -125,13 +125,11 @@ The CI build takes longer (qemu), the phone is much faster.
   `?folder=` / `?workspace=` of the workbench (kept in the app's preferences, checked for existence) and loads it instead of
   always `/root/Workspace`; when the screen is left the page keeps running for 8 more seconds so it can write its latest editor
   state before it is paused or destroyed.
-* **Mode 3 — Antigravity IDE (desktop).** Google's VS Code based editor, run exactly like Mode 1: same Xtigervnc + Openbox
-  screen, same native viewer, same quality / fast-cores options (`start-vscode-session.sh antigravity`). Nothing of it is in the
-  APK: on the first start `AntigravityInstaller` takes `Antigravity*.tar.gz` from the project folder if one is there, otherwise
-  downloads the Linux ARM64 IDE tarball from Google (address read from antigravity.google/download, with the known release as
-  fallback; resumable), checks that it is an Electron app and an ARM64 build, and unpacks it to `/opt/antigravity`. Its user data
-  is `/root/.config/Antigravity` and `/root/.antigravity/extensions` (separate from VS Code). Links the IDE opens (the Google
-  sign-in) go through an `xdg-open` replacement (`/tmp/.pocket-bin`, only for this program) to the Android browser; only
-  http(s) links are accepted. "Remove Antigravity program" deletes `/opt/antigravity` again (settings and login stay). Known
-  risk: other people reported that Antigravity's AI backend crashed on ARM64 under PRoot (Feb 2026, before Google's ARM64
-  build); whether it runs on a given phone has to be tried. Mode 1 and Mode 2 are not changed by Mode 3.
+* **No Antigravity mode.** A Mode 3 for Google's Antigravity IDE was tried and removed again (it needs a lot of storage). If
+  an earlier test build left its files in the Linux system (`/opt/antigravity`, a half-finished download, `~/.config/Antigravity`,
+  `~/.antigravity`), the cleanup after start and the "Free up space" button delete them.
+* **Move to SD card.** The manifest now says `android:installLocation="auto"`, which is what makes Android's own App info →
+  Storage → "Change" offer an SD card (the whole app, program and data, moves). The ready screen has a shortcut button that
+  opens that page. Whether the option appears depends on the phone: the SD card normally has to be formatted as internal
+  ("adoptable") storage, and some phones do not support that. An SD card is slower than internal storage, which shows when
+  VS Code starts or searches many files.

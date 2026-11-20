@@ -4,8 +4,6 @@
 #   x11    : Mode 1 — Xtigervnc :1 (size chosen in the app, see GEOMETRY) + Openbox + full Electron VS Code Desktop.
 #            The app shows the desktop itself (native viewer, straight on port 5901); only when the "web" viewer is
 #            chosen (/root/.pocket-viewer) is noVNC (websockify on 6080) started as well. Never throttled, no watcher.
-#   antigravity : Mode 3 — the same virtual screen and viewer as Mode 1, but the program is the Antigravity IDE that the app
-#            installed in /opt/antigravity (see AntigravityInstaller). Mode 1 and Mode 2 are not touched by it.
 #   direct : Mode 2 — official `code serve-web` on 127.0.0.1:8080 with the battery saver:
 #            the app refreshes /tmp/.pocket-mode2-heartbeat while a Mode 2 window is open; when it has not been
 #            refreshed for 10 minutes the server is hibernated with SIGTERM (0 % background drain). Re-opening
@@ -239,7 +237,7 @@ vscode_main_alive() {
 # its tabs, cursor positions and unsaved edits (they are kept per folder). On the first start, or when that folder is
 # gone, the project folder is opened.
 pick_open_path() {
-    local state="${1:-/root/.config/Code/User/globalStorage/storage.json}" line p
+    local state="/root/.config/Code/User/globalStorage/storage.json" line p
     if [ -f "$state" ]; then
         line=$(grep -A12 '"lastActiveWindow"' "$state" 2>/dev/null | grep -o '"folder"[[:space:]]*:[[:space:]]*"file://[^"]*"' | head -n 1)
         p="${line#*file://}"
@@ -254,124 +252,6 @@ pick_open_path() {
     fi
     printf '%s' "/root/Workspace"
 }
-
-# ------------------------------------------------------------------------------------------------
-# Mode 3 — Antigravity IDE (the virtual screen above is shared with Mode 1)
-# ------------------------------------------------------------------------------------------------
-AG_ROOT="${POCKET_AG_ROOT:-/opt/antigravity}"
-
-# The folder that holds resources/app (the archive may or may not have a top folder).
-ag_find_dir() {
-    local d
-    for d in "$AG_ROOT" "$AG_ROOT"/* "$AG_ROOT"/*/* "$AG_ROOT"/*/*/*; do
-        [ -d "$d/resources" ] || continue
-        if [ -d "$d/resources/app" ] || [ -f "$d/resources/app.asar" ]; then
-            printf '%s' "$d"
-            return 0
-        fi
-    done
-    return 1
-}
-
-# True when $1 is an ELF file for ARM64 (machine id 0xB7 at offset 18).
-ag_is_arm64() {
-    [ "$(od -An -tx1 -j18 -N2 "$1" 2>/dev/null | tr -d ' \n')" = "b700" ]
-}
-
-# The Electron program: the one the app recorded at install time, otherwise the biggest ELF file in the app folder.
-ag_find_main() {
-    local dir="$1" rec f size best="" bestsize=0
-    rec=$(sed -n 's/^main=//p' "$AG_ROOT/.pocket-installed" 2>/dev/null | head -n 1)
-    if [ -n "$rec" ] && [ -f "$AG_ROOT/$rec" ] && [ -x "$AG_ROOT/$rec" ]; then
-        printf '%s' "$AG_ROOT/$rec"
-        return 0
-    fi
-    for f in "$dir"/*; do
-        [ -f "$f" ] && [ -x "$f" ] && [ ! -L "$f" ] || continue
-        [ "$(od -An -tx1 -N4 "$f" 2>/dev/null | tr -d ' \n')" = "7f454c46" ] || continue
-        size=$(stat -c %s "$f" 2>/dev/null) || continue
-        if [ "$size" -gt "$bestsize" ] || { [ "$size" -eq "$bestsize" ] && [ "${#f}" -lt "${#best}" ]; }; then
-            best="$f"
-            bestsize="$size"
-        fi
-    done
-    [ -n "$best" ] || return 1
-    printf '%s' "$best"
-}
-
-# Links the IDE opens (the Google sign-in page above all) go to the Android browser: xdg-open is replaced, for this
-# program only, by a tiny script that leaves the address in /tmp/.pocket-open-url, which the app opens.
-install_link_bridge() {
-    mkdir -p /tmp/.pocket-bin
-    cat > /tmp/.pocket-bin/xdg-open <<'SHIM'
-#!/bin/sh
-# Pocket: hand the link to the Android app (it watches /tmp/.pocket-open-url)
-url="$1"
-[ -n "$url" ] || exit 0
-echo "[pocket-open] $url"
-printf '%s' "$url" > /tmp/.pocket-open-url.tmp && mv -f /tmp/.pocket-open-url.tmp /tmp/.pocket-open-url
-exit 0
-SHIM
-    chmod 755 /tmp/.pocket-bin/xdg-open
-    for n in x-www-browser sensible-browser gnome-open kde-open; do
-        ln -sf xdg-open "/tmp/.pocket-bin/$n"
-    done
-}
-
-if [ "$MODE" = "antigravity" ]; then
-    AG_DIR=$(ag_find_dir) || {
-        echo "[start-antigravity] Antigravity is not installed (no resources/app folder under $AG_ROOT)."
-        exit 3
-    }
-    AG_MAIN=$(ag_find_main "$AG_DIR") || {
-        echo "[start-antigravity] No program file found in $AG_DIR."
-        exit 3
-    }
-    if ! ag_is_arm64 "$AG_MAIN"; then
-        echo "[start-antigravity] $AG_MAIN is not an ARM64 program - install the Linux ARM64 build."
-        exit 3
-    fi
-    echo "[start-antigravity] Program: $AG_MAIN"
-    mkdir -p /root/.config/Antigravity/User /root/.antigravity/extensions
-    install_link_bridge
-    VSC_MAIN="$AG_MAIN"
-    export VSCODE_CLI=1
-    AG_RESTARTS=0
-    AG_RC=0
-    while true; do
-        ensure_display
-        AG_STARTED=$(date +%s)
-        OPEN_PATH=$(pick_open_path /root/.config/Antigravity/User/globalStorage/storage.json)
-        echo "[start-antigravity] Opening $OPEN_PATH"
-        PATH="/tmp/.pocket-bin:$PATH" BROWSER="/tmp/.pocket-bin/xdg-open" "${PIN[@]}" dbus-run-session -- "$AG_MAIN" \
-            --no-sandbox \
-            --disable-smooth-scrolling \
-            --disable-gpu \
-            --disable-gpu-sandbox \
-            --disable-dev-shm-usage \
-            --password-store="basic" \
-            --user-data-dir="/root/.config/Antigravity" \
-            --extensions-dir="/root/.antigravity/extensions" \
-            "$OPEN_PATH"
-        AG_RC=$?
-        # A second start forwards to a running one and returns at once: wait until the program really quits.
-        if [ "$AG_RC" -eq 0 ]; then
-            for _i in 1 2 3; do vscode_main_alive && break; sleep 1; done
-            while vscode_main_alive; do sleep 1; done
-        fi
-        echo "[start-antigravity] Antigravity exited with code $AG_RC"
-        if [ "$AG_RC" -eq 0 ]; then break; fi
-        if [ $(( $(date +%s) - AG_STARTED )) -ge 120 ]; then AG_RESTARTS=0; fi
-        AG_RESTARTS=$((AG_RESTARTS + 1))
-        if [ "$AG_RESTARTS" -gt 10 ]; then
-            echo "[start-antigravity] Antigravity keeps crashing - giving up."
-            break
-        fi
-        echo "[start-antigravity] Antigravity crashed - restarting in 3 s (attempt $AG_RESTARTS of 10)."
-        sleep 3
-    done
-    exit "$AG_RC"
-fi
 
 # If VS Code crashes (exit code != 0) it is started again and reopens the previous windows; closing it normally
 # (exit code 0) ends the session. Ten quick crashes in a row stop the loop.
