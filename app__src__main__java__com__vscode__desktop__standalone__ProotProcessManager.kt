@@ -817,6 +817,16 @@ class ProotProcessManager(context: Context) {
         }
     }
 
+    /** Mode 3: the same auto-save / hot exit / window restore in Antigravity's own settings. Call it while it is not running. */
+    fun ensureAntigravitySettings() {
+        try {
+            val dir = File(homeDir, ".config/Antigravity/User").apply { mkdirs() }
+            mergeMode2Settings(File(dir, "settings.json"))
+        } catch (e: Exception) {
+            AppLog.add("Warning: could not write the Antigravity settings: ${e.message}")
+        }
+    }
+
     /**
      * Mode 1: the same 0.5 s auto-save, hot exit and window restore as Mode 2. The desktop's settings file is the one
      * Mode 2 shares (see [ensureSharedState]), so it already carries them once Mode 2 has run; this makes a Mode 1-only

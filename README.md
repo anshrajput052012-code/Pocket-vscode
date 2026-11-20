@@ -125,3 +125,13 @@ The CI build takes longer (qemu), the phone is much faster.
   `?folder=` / `?workspace=` of the workbench (kept in the app's preferences, checked for existence) and loads it instead of
   always `/root/Workspace`; when the screen is left the page keeps running for 8 more seconds so it can write its latest editor
   state before it is paused or destroyed.
+* **Mode 3 — Antigravity IDE (desktop).** Google's VS Code based editor, run exactly like Mode 1: same Xtigervnc + Openbox
+  screen, same native viewer, same quality / fast-cores options (`start-vscode-session.sh antigravity`). Nothing of it is in the
+  APK: on the first start `AntigravityInstaller` takes `Antigravity*.tar.gz` from the project folder if one is there, otherwise
+  downloads the Linux ARM64 IDE tarball from Google (address read from antigravity.google/download, with the known release as
+  fallback; resumable), checks that it is an Electron app and an ARM64 build, and unpacks it to `/opt/antigravity`. Its user data
+  is `/root/.config/Antigravity` and `/root/.antigravity/extensions` (separate from VS Code). Links the IDE opens (the Google
+  sign-in) go through an `xdg-open` replacement (`/tmp/.pocket-bin`, only for this program) to the Android browser; only
+  http(s) links are accepted. "Remove Antigravity program" deletes `/opt/antigravity` again (settings and login stay). Known
+  risk: other people reported that Antigravity's AI backend crashed on ARM64 under PRoot (Feb 2026, before Google's ARM64
+  build); whether it runs on a given phone has to be tried. Mode 1 and Mode 2 are not changed by Mode 3.

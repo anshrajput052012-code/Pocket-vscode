@@ -5,6 +5,7 @@ import android.annotation.SuppressLint
 import android.content.ActivityNotFoundException
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.app.AlertDialog
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -253,6 +254,7 @@ class MainActivity : AppCompatActivity(), ProvisionListener {
         readyFolderLabel.text = prefs.workspace ?: AppPrefs.defaultWorkspace()
         when (prefs.lastMode) {
             "direct" -> modeGroup.check(ID_MODE2)
+            "antigravity" -> modeGroup.check(ID_MODE3)
             else -> modeGroup.check(ID_MODE1)
         }
         updateMode1OptionsVisibility()
@@ -372,12 +374,19 @@ class MainActivity : AppCompatActivity(), ProvisionListener {
             startProvisioning()
             return
         }
-        if (modeGroup.checkedRadioButtonId == ID_MODE2) {
-            prefs.lastMode = "direct"
-            launchMode2()
-        } else {
-            prefs.lastMode = "x11"
-            launchMode1()
+        when (modeGroup.checkedRadioButtonId) {
+            ID_MODE2 -> {
+                prefs.lastMode = "direct"
+                launchMode2()
+            }
+            ID_MODE3 -> {
+                prefs.lastMode = "antigravity"
+                launchMode1(antigravity = true)
+            }
+            else -> {
+                prefs.lastMode = "x11"
+                launchMode1()
+            }
         }
     }
 
@@ -391,7 +400,8 @@ class MainActivity : AppCompatActivity(), ProvisionListener {
     }
 
     /** Mode 1: full Electron desktop through Xtigervnc + Openbox, shown by the native viewer (or noVNC as a fallback). */
-    private fun launchMode1() {
+    private fun launchMode1(antigravity: Boolean = false) {
+        val label = if (antigravity) "Mode 3" else "Mode 1"
         val workspace = prefs.workspace ?: AppPrefs.defaultWorkspace()
         val nativeViewer = prefs.mode1Viewer == AppPrefs.VIEWER_NATIVE
         activeNativeViewer = nativeViewer
@@ -400,7 +410,11 @@ class MainActivity : AppCompatActivity(), ProvisionListener {
         vncView?.stop()
         launchButton.isEnabled = false
         launchButton.alpha = 0.5f
-        statusText.text = "Starting Mode 1 (Xtigervnc + Openbox + VS Code)…"
+        statusText.text = if (antigravity) {
+            "Starting Mode 3 (Antigravity)…"
+        } else {
+            "Starting Mode 1 (Xtigervnc + Openbox + VS Code)…"
+        }
         // one mode at a time: the two modes share settings and extensions
         Mode1Session.starting = true
         if (Mode2Server.isProcessAlive) AppLog.add("Stopping Mode 2 (Mode 1 shares its settings and extensions).")
@@ -414,13 +428,19 @@ class MainActivity : AppCompatActivity(), ProvisionListener {
             var errorMessage: String? = null
             try {
                 Mode1Session.stop()
-                prootManager.ensureSharedState()
-                prootManager.ensureMode1Settings()
+                if (antigravity) {
+                    ensureAntigravityInstalled(workspace)
+                    prootManager.ensureAntigravitySettings()
+                    File(prootManager.tmpDir, ".pocket-open-url").delete()
+                } else {
+                    prootManager.ensureSharedState()
+                    prootManager.ensureMode1Settings()
+                }
                 prootManager.writeMode1Geometry(screenW, screenH)
                 prootManager.writeMode1Viewer(nativeViewer)
                 prootManager.writeMode1FastCores(fastCores)
                 val p = prootManager.startProotCommand(
-                    command = "bash /root/start-vscode-session.sh x11",
+                    command = "bash /root/start-vscode-session.sh " + if (antigravity) "antigravity" else "x11",
                     workspaceHostPath = workspace,
                     displayMode = "x11",
                     onLogLine = { line ->
@@ -431,11 +451,16 @@ class MainActivity : AppCompatActivity(), ProvisionListener {
                 started = p
                 Mode1Session.process = p
                 Mode1Session.starting = false
+                if (antigravity) startLinkBridge(p)
                 p.waitFor()
             } catch (e: Exception) {
                 Mode1Session.starting = false
-                errorMessage = "Could not start Mode 1: ${e.message}"
-                AppLog.add("Mode 1 failed: ${e.message}")
+                errorMessage = if (e is AntigravityInstaller.InstallException) {
+                    e.message
+                } else {
+                    "Could not start $label: ${e.message}"
+                }
+                AppLog.add("$label failed: ${e.message}")
             }
             val current = started
             val wasCurrent = if (current != null) Mode1Session.clearIfCurrent(current) else true
@@ -445,10 +470,109 @@ class MainActivity : AppCompatActivity(), ProvisionListener {
                     launchButton.isEnabled = true
                     launchButton.alpha = 1f
                     if (currentScreen == Screen.MODE1) showReady()
-                    statusText.text = errorMessage ?: "Mode 1 session ended."
+                    statusText.text = errorMessage ?: "$label session ended."
                 }
             }
         }, "mode1-session").start()
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Mode 3 (Antigravity): installation, links to the Android browser, removal
+    // ---------------------------------------------------------------------------------------------
+
+    /** First start only: finds "Antigravity IDE.tar.gz" in the project folder or downloads it, then unpacks it. */
+    private fun ensureAntigravityInstalled(workspace: String) {
+        if (AntigravityInstaller.isInstalled(prootManager.rootfsDir)) return
+        AppLog.add("Installing Antigravity (first start)…")
+        AntigravityInstaller.install(
+            rootfsDir = prootManager.rootfsDir,
+            tmpDir = prootManager.tmpDir,
+            projectDir = File(workspace),
+            onStatus = { msg -> runOnUiThread { statusText.text = msg } },
+            log = { AppLog.add(it) }
+        )
+    }
+
+    /**
+     * Links the IDE wants to open (the Google sign-in above all) arrive as a file written by its xdg-open replacement;
+     * they are opened in the Android browser. Only http(s) addresses are accepted.
+     */
+    private fun startLinkBridge(p: Process) {
+        val file = File(prootManager.tmpDir, ".pocket-open-url")
+        Thread({
+            while (p.isAlive) {
+                try {
+                    if (file.isFile) {
+                        val url = file.readText().trim()
+                        file.delete()
+                        if (url.isNotEmpty()) openLinkFromDesktop(url)
+                    }
+                } catch (_: Exception) {
+                }
+                try {
+                    Thread.sleep(600)
+                } catch (_: InterruptedException) {
+                    return@Thread
+                }
+            }
+        }, "link-bridge").apply {
+            isDaemon = true
+            start()
+        }
+    }
+
+    private fun openLinkFromDesktop(url: String) {
+        val uri = try {
+            Uri.parse(url)
+        } catch (_: Exception) {
+            return
+        }
+        val scheme = uri.scheme?.lowercase()
+        if ((scheme != "http" && scheme != "https") || uri.host.isNullOrEmpty()) {
+            AppLog.add("Ignored a link with an unsupported address.")
+            return
+        }
+        AppLog.add("Opening in the Android browser: $url")
+        runOnUiThread {
+            try {
+                startActivity(
+                    Intent(Intent.ACTION_VIEW, uri)
+                        .addCategory(Intent.CATEGORY_BROWSABLE)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+            } catch (e: Exception) {
+                AppLog.add("No browser could open the link: ${e.message}")
+                Toast.makeText(this, "No browser found to open the link.", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    /** Deletes the Antigravity program (not its settings, extensions or login) to free its storage. */
+    private fun removeAntigravityNow() {
+        val dir = AntigravityInstaller.installDir(prootManager.rootfsDir)
+        if (!dir.exists()) {
+            statusText.text = "Antigravity is not installed."
+            return
+        }
+        if (Mode1Session.isAlive || Mode1Session.starting) {
+            statusText.text = "Close the running desktop session first (Mode 1 or 3)."
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Remove Antigravity?")
+            .setMessage(
+                "The Antigravity program is deleted to free its storage. Your settings, extensions, login and projects " +
+                    "stay. The next Mode 3 start installs it again."
+            )
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Remove") { _, _ ->
+                statusText.text = "Removing Antigravity…"
+                Thread({
+                    AntigravityInstaller.deleteTree(dir)
+                    runOnUiThread { statusText.text = "Antigravity was removed." }
+                }, "remove-antigravity").start()
+            }
+            .show()
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -863,6 +987,11 @@ class MainActivity : AppCompatActivity(), ProvisionListener {
         buttonTintList = ColorStateList.valueOf(ACCENT)
     }
 
+    private fun updateLaunchLabel() {
+        if (!::launchButton.isInitialized) return
+        launchButton.text = if (modeGroup.checkedRadioButtonId == ID_MODE3) "Launch Antigravity" else "Launch VS Code"
+    }
+
     private fun updateMode1OptionsVisibility() {
         val v = if (modeGroup.checkedRadioButtonId == ID_MODE2) View.GONE else View.VISIBLE
         qualityBox.visibility = v
@@ -1053,6 +1182,14 @@ class MainActivity : AppCompatActivity(), ProvisionListener {
                     buttonTintList = ColorStateList.valueOf(ACCENT)
                 }
             )
+            addView(
+                RadioButton(this@MainActivity).apply {
+                    id = ID_MODE3
+                    text = "Mode 3 — Antigravity IDE (desktop)\nGoogle's AI editor on the same screen as Mode 1 · installs itself on the first start (internet needed)"
+                    setTextColor(TEXT)
+                    buttonTintList = ColorStateList.valueOf(ACCENT)
+                }
+            )
         }
         readyColumn.addView(modeGroup)
 
@@ -1110,7 +1247,10 @@ class MainActivity : AppCompatActivity(), ProvisionListener {
         readyColumn.addView(viewerBox)
 
         // quality and viewer only matter for Mode 1
-        modeGroup.setOnCheckedChangeListener { _, _ -> updateMode1OptionsVisibility() }
+        modeGroup.setOnCheckedChangeListener { _, _ ->
+            updateMode1OptionsVisibility()
+            updateLaunchLabel()
+        }
 
         launchButton = makeButton("Launch VS Code", primary = true) { launchSelected() }
         readyColumn.addView(launchButton)
@@ -1118,6 +1258,7 @@ class MainActivity : AppCompatActivity(), ProvisionListener {
         readyColumn.addView(verifyButton)
         readyColumn.addView(makeButton("Free up space (old downloads, logs, caches)", primary = false) { freeUpSpaceNow() })
         readyColumn.addView(makeButton("Storage report (what uses the space)", primary = false) { storageReportNow() })
+        readyColumn.addView(makeButton("Remove Antigravity program (frees its space)", primary = false) { removeAntigravityNow() })
 
         statusText = makeText("", 13f, GREEN).apply { setPadding(0, dp(14), 0, dp(6)) }
         readyColumn.addView(statusText)
@@ -1141,6 +1282,7 @@ class MainActivity : AppCompatActivity(), ProvisionListener {
     companion object {
         private const val ID_MODE1 = 1001
         private const val ID_MODE2 = 1002
+        private const val ID_MODE3 = 1003
         private const val ID_Q_BALANCED = 1101
         private const val ID_Q_SHARP = 1102
         private const val ID_Q_NATIVE = 1103
